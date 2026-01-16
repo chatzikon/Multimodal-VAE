@@ -836,5 +836,5 @@ def evaluate_main(latent_dim=256, model_checkpoint='checkpoints/final_model_256.
 if __name__ == "__main__":
     # consistency checking scores
     #evaluate_main(latent_dim=128, model_checkpoint='checkpoints/final_model_128.pt')
-    evaluate_main(latent_dim=256, model_checkpoint='checkpoints/final_model_256.pt')
+    evaluate_main(latent_dim=256, model_checkpoint='final_model.pt')
     #evaluate_main(latent_dim=512, model_checkpoint='checkpoints/final_model_512.pt')
