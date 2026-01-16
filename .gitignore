@@ -1,0 +1,5 @@
+# Ignore the data folder and everything inside it
+data/
+
+# Ignore the CelebAMask-HQ zip file
+CelebAMask-HQ.zip
