@@ -234,6 +234,16 @@ def custom_collate_fn(batch):
     }
     return batch_dict
 
+def custom_collate_fn_flickr(batch):
+    images = torch.stack([item['image'] for item in batch])
+    captions = [item['caption'] for item in batch]
+
+    batch_dict = {
+        'image': images,
+        'caption': captions,
+    }
+    return batch_dict
+
 class CelebADataset(Dataset):
     def __init__(self, dataset, max_length=64):
         self.dataset = dataset

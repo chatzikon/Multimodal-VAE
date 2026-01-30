@@ -1,6 +1,6 @@
 config = {
     'latent_dim': 256,
-    'batch_size': 16,
+    'batch_size': 128,
     'learning_rate_G': 1e-4,
     'learning_rate_D': 1e-5,
     'checkpoint_freq': 10,
@@ -11,11 +11,17 @@ config = {
     'num_vis_samples': 5,
     'val_split': 0.1,
     'seed': 42,
-    'phase1_epochs': 40,
-    'phase2_epochs': 30,
-    'phase3_epochs': 70,
+    'max_length':32,
+    # 'phase1_epochs': 40,
+    # 'phase2_epochs': 30,
+    # 'phase3_epochs': 70,
+    'phase1_epochs': 1,
+    'phase2_epochs': 1,
+    'phase3_epochs': 1,
     'resume_phase': None,
     'resume_epoch': None,
+    #'dataset': 'CelebAMask-HQ',
+    'dataset': 'Flickr30k',
 
     'phase_configs': {
         1: {
@@ -28,7 +34,7 @@ config = {
             'adversarial_weight': 0.0,
             'instance_noise': 0.0,
             'noise_decay': 0.9,
-            'use_gradient_penalty': False
+            'use_gradient_penalty': False,
         },
         2: {
             'reconstruction_weight': 1.0,
@@ -40,7 +46,7 @@ config = {
             'adversarial_weight': 0.0,
             'instance_noise': 0.0,
             'noise_decay': 0.9,
-            'use_gradient_penalty': False
+            'use_gradient_penalty': False,
         },
         3: {
             'reconstruction_weight': 1.0,
@@ -52,7 +58,7 @@ config = {
             'adversarial_weight': 0.001,
             'instance_noise': 0.01,
             'noise_decay': 0.9,
-            'use_gradient_penalty': True
+            'use_gradient_penalty': True,
         }
     }
 }

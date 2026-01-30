@@ -20,7 +20,7 @@ from src.data.utils import clean_and_validate_attributes
 from src.visualization import VisualizationUtils
 
 def load_model_and_data(device, latent_dim, model_checkpoint='final_model.pt'):
-    checkpoint = torch.load(model_checkpoint, map_location=device)
+    checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=False)
     model = MultimodalVAE(
         latent_dim=latent_dim,
         temperature=1.0
@@ -522,7 +522,8 @@ def visualize_consistency_pairs(model, dataset, device, num_samples=3, save_dir=
                     ha='center', va='center',
                     transform=ax.transAxes,
                     fontsize=28, fontweight='bold', color=score_color)
-    
+
+
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'consistency_pairs.png'), bbox_inches='tight', dpi=300, pad_inches=0.5)
     plt.close(fig)
@@ -607,7 +608,8 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, s
     # Find index for male attribute
     male_idx = None
     for k, v in model.idx_to_attribute.items():
-        if v == 'male':
+        #if v == 'male':
+        if v == 'black_hair':
             male_idx = k
             break
 
@@ -634,7 +636,7 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, s
     z_texts = np.array(z_texts)
 
     # Compute t-SNE embeddings separately
-    tsne = TSNE(n_components=2, perplexity=perplexity, n_iter=1000, random_state=42)
+    tsne = TSNE(n_components=2, perplexity=perplexity, max_iter=1000, random_state=42)
     z_img_tsne = tsne.fit_transform(z_images)
     z_txt_tsne = tsne.fit_transform(z_texts)
 
@@ -789,7 +791,7 @@ def evaluate_train_val(model, device, train_subset, val_subset):
     val_scores = evaluate_consistency(model, val_subset, device)
     print("Validation Set Consistency Accuracy:", val_scores['accuracy'])
     
-def evaluate_main(latent_dim=256, model_checkpoint='checkpoints/final_model_256.pt'):
+def evaluate_main(kl_coef, latent_dim=256, model_checkpoint='checkpoints/final_model_256.pt'):
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     random.seed(config['seed'])
@@ -813,8 +815,8 @@ def evaluate_main(latent_dim=256, model_checkpoint='checkpoints/final_model_256.
     evaluate_train_val(model, device, train_subset, val_subset)
     
     # confusion matrix for consistency pairs
-    metrics = visualize_consistency_pairs(model, val_subset, device, num_samples=3)
-    visualize_consistency_confusion_matrix(metrics)
+    metrics = visualize_consistency_pairs(model, val_subset, device, num_samples=3, save_dir='eval_results/'+str(kl_coef))
+    visualize_consistency_confusion_matrix(metrics, save_dir='eval_results/'+str(kl_coef))
     scores = evaluate_consistency(model, val_subset, device)
     print(f"Consistency Classification Accuracy: {scores['accuracy']:.3f}")
     print(f"Threshold used: {scores['threshold']}")
@@ -823,7 +825,7 @@ def evaluate_main(latent_dim=256, model_checkpoint='checkpoints/final_model_256.
     # Visualize pairs with scores
     #visualize_consistency_pairs(model, val_subset, device)
     
-    #visualize_paired_latent_spaces_2d(model, val_subset, device, num_samples=500, save_dir='eval_results')
+    visualize_paired_latent_spaces_2d(model, val_subset, device, num_samples=500, save_dir='eval_results/'+str(kl_coef))
         
     # Visualize 5 samples of image-to-text generation
     #visualize_image_to_text_generation(model, val_subset, device, num_samples=10, save_dir='eval_results')
@@ -834,7 +836,10 @@ def evaluate_main(latent_dim=256, model_checkpoint='checkpoints/final_model_256.
     #visualize_random_examples(full_dataset, num_samples=5)
     
 if __name__ == "__main__":
+
+    kl_coef='kl_coef_1'
+
     # consistency checking scores
     #evaluate_main(latent_dim=128, model_checkpoint='checkpoints/final_model_128.pt')
-    evaluate_main(latent_dim=256, model_checkpoint='final_model.pt')
+    evaluate_main(kl_coef, latent_dim=256, model_checkpoint='checkpoints/final_model_'+str(kl_coef)+'.pt')
     #evaluate_main(latent_dim=512, model_checkpoint='checkpoints/final_model_512.pt')

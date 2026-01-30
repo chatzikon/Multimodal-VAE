@@ -1,5 +1,10 @@
 # Ignore the data folder and everything inside it
 data/
+results/
+training/
+checkpoints/
+eval_results/
+huggingface_data/
 
 # Ignore the CelebAMask-HQ zip file
 CelebAMask-HQ.zip

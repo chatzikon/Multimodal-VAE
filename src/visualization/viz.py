@@ -197,8 +197,8 @@ class VisualizationUtils:
         plt.savefig(os.path.join(self.save_dir,f'comparisons_epoch_{epoch}.png'))
         plt.close()
 
-def visualize_results(model, test_dataset, epoch, phase_name, num_samples=5, device='cuda'):
-    viz = VisualizationUtils(save_dir=f'results/{phase_name}')
+def visualize_results(kl_coef, model, test_dataset, epoch, phase_name, num_samples=5, device='cuda'):
+    viz = VisualizationUtils(save_dir=f'results/{phase_name}_kl_coef_{kl_coef}')
     samples = [test_dataset[i] for i in range(min(num_samples,len(test_dataset)))]
     images = torch.stack([s['image'] for s in samples]).to(device)
     texts = [s['caption'] for s in samples]

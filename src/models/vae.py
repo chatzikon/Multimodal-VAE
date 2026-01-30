@@ -8,7 +8,7 @@ from ..training.losses import identity_consistency_loss, compute_distribution_ma
 from ..data.utils import clean_and_validate_attributes, generate_natural_description
 
 class ImageEncoder(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, dataset):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(3, 64, 4, 2, 1),
@@ -26,8 +26,16 @@ class ImageEncoder(nn.Module):
             nn.Flatten(),
         )
 
+        # if dataset=='CelebAMask-HQ':
+        #     self.fc_mu = nn.Linear(256 * 8 * 8, latent_dim)
+        #     self.fc_var = nn.Linear(256 * 8 * 8, latent_dim)
+        # elif dataset=='Flickr30k':
+        #     self.fc_mu = nn.Linear(256 * 28 * 28, latent_dim)
+        #     self.fc_var = nn.Linear(256 * 28 * 28, latent_dim)
+
         self.fc_mu = nn.Linear(256 * 8 * 8, latent_dim)
         self.fc_var = nn.Linear(256 * 8 * 8, latent_dim)
+
 
     def forward(self, x):
         features = self.encoder(x)
@@ -70,7 +78,7 @@ class TextDecoder(nn.Module):
         return attribute_probs, predicted_attributes
 
 class ImageDecoder(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, dataset):
         super().__init__()
 
         self.decoder_input = nn.Sequential(
@@ -82,6 +90,8 @@ class ImageDecoder(nn.Module):
         )
 
         self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8)
+
+
 
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(512, 512, 4, 2, 1),
@@ -108,6 +118,9 @@ class ImageDecoder(nn.Module):
             nn.Tanh()
         )
 
+
+
+
     def forward(self, z):
         x = self.decoder_input(z)
         x = x.view(-1,512,4,4)
@@ -121,15 +134,15 @@ class ImageDecoder(nn.Module):
         return self.decoder(x)
 
 class MultimodalVAE(nn.Module):
-    def __init__(self, latent_dim=512, num_attributes=10, temperature=1.0):
+    def __init__(self, dataset, latent_dim=512, num_attributes=10, temperature=1.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_attributes = num_attributes
         self.temperature = temperature
 
-        self.image_encoder = ImageEncoder(latent_dim)
+        self.image_encoder = ImageEncoder(latent_dim,dataset)
         self.text_encoder = TextEncoder(latent_dim, num_attributes)
-        self.image_decoder = ImageDecoder(latent_dim)
+        self.image_decoder = ImageDecoder(latent_dim, dataset)
         self.text_decoder = TextDecoder(latent_dim, num_attributes)
 
         self.norm_layer = nn.LayerNorm(latent_dim)
@@ -184,12 +197,12 @@ class MultimodalVAE(nn.Module):
     def decode_image(self, z):
         return self.image_decoder(z)
 
-    def decode_text(self, z, generation_params=None):
-        if generation_params is None:
-            generation_params = {'threshold':0.5}
-        attr_probs, pred_attributes = self.text_decoder(z, **generation_params)
-        descriptions = self._attributes_to_text(pred_attributes)
-        return attr_probs, pred_attributes, descriptions
+    # def decode_text(self, z, generation_params=None):
+    #     if generation_params is None:
+    #         generation_params = {'threshold':0.5}
+    #     attr_probs, pred_attributes = self.text_decoder(z, **generation_params)
+    #     descriptions = self._attributes_to_text(pred_attributes)
+    #     return attr_probs, pred_attributes, descriptions
 
     def forward(self, images=None, target_attributes=None):
         outputs = {}
@@ -213,7 +226,7 @@ class MultimodalVAE(nn.Module):
             attr_probs, pred_attributes = self.text_decoder(z_text)
             outputs['recon_text_probs'] = attr_probs
             outputs['recon_text_attributes'] = pred_attributes
-            outputs['recon_text'] = self._attributes_to_text(pred_attributes)
+            #outputs['recon_text'] = self._attributes_to_text(pred_attributes)
 
             image_from_text = self.decode_image(z_text)
             outputs['image_from_text'] = image_from_text
@@ -236,25 +249,25 @@ class MultimodalVAE(nn.Module):
         ))
         return 1 / (1 + kl_match)
 
-    @torch.no_grad()
-    def generate_from_text(self, attributes):
-        device = next(self.parameters()).device
-        attributes = attributes.to(device)
-        z_text, _, _ = self.encode_text(attributes)
-        return self.decode_image(z_text)
-
-    @torch.no_grad()
-    def generate_from_image(self, image):
-        device = next(self.parameters()).device
-        image = image.to(device)
-        if image.dim() == 3:
-            image = image.unsqueeze(0)
-        z_image, _, _ = self.encode_image(image)
-        _, pred_attributes = self.text_decoder(z_image)
-        descriptions = self._attributes_to_text(pred_attributes)
-        if len(descriptions) == 1:
-            return descriptions[0]
-        return descriptions
+    # @torch.no_grad()
+    # def generate_from_text(self, attributes):
+    #     device = next(self.parameters()).device
+    #     attributes = attributes.to(device)
+    #     z_text, _, _ = self.encode_text(attributes)
+    #     return self.decode_image(z_text)
+    #
+    # @torch.no_grad()
+    # def generate_from_image(self, image):
+    #     device = next(self.parameters()).device
+    #     image = image.to(device)
+    #     if image.dim() == 3:
+    #         image = image.unsqueeze(0)
+    #     z_image, _, _ = self.encode_image(image)
+    #     _, pred_attributes = self.text_decoder(z_image)
+    #     descriptions = self._attributes_to_text(pred_attributes)
+    #     if len(descriptions) == 1:
+    #         return descriptions[0]
+    #     return descriptions
 
     def sample_latent(self, batch_size=1):
         device = next(self.parameters()).device

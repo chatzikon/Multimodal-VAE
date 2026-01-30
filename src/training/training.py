@@ -15,17 +15,19 @@ from .losses import (
 from ..visualization.viz import visualize_results
 
 class TrainingManager:
-    def __init__(self, save_dir='training'):
+    def __init__(self, kl_coef, save_dir='training'):
         self.save_dir = save_dir
         os.makedirs(save_dir,exist_ok=True)
-        self.history_path = os.path.join(save_dir,'history.csv')
+        self.history_path = os.path.join(save_dir,'history_'+str(kl_coef)+'.csv')
         self.history=[]
-        self.info_path = os.path.join(save_dir,'run_info.json')
+        self.info_path = os.path.join(save_dir,'run_info_'+str(kl_coef)+'.json')
+        self.kl_coef=kl_coef
+
 
     def save_checkpoint(self, epoch, model, discriminator, optimizer_G, optimizer_D, loss, phase):
-        phase_checkpoint_dir = os.path.join(self.save_dir, 'checkpoints', f'phase{phase}')
+        phase_checkpoint_dir = os.path.join(self.save_dir, 'checkpoints', str(self.kl_coef), f'phase{phase}')
         os.makedirs(phase_checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(phase_checkpoint_dir,f'checkpoint_epoch_{epoch}.pt')
+        checkpoint_path = os.path.join(phase_checkpoint_dir,f'checkpoint_epoch_{epoch}_kl_coef_{self.kl_coef}.pt')
         torch.save({
             'epoch':epoch,
             'model_state_dict':model.state_dict(),
@@ -52,9 +54,14 @@ class TrainingManager:
         df = pd.DataFrame(self.history)
         df.to_csv(self.history_path,index=False)
 
-def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, epoch, phase_config):
+def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, epoch, phase_config, clip_tokenizer):
     images = batch['image'].to(device)
-    target_attributes = batch['attributes'].to(device) if 'attributes' in batch else None
+    if phase_config['dataset']=='CelebAMask-HQ':
+        target_attributes = batch['attributes'].to(device) if 'attributes' in batch else None
+    elif phase_config['dataset']=='Flickr30k':
+        text = batch["caption"]
+        input_tokens = clip_tokenizer(text).to(device)
+        target_attributes = input_tokens['input_ids'].to(torch.float)
 
     outputs = model(images=images, target_attributes=target_attributes)
 
@@ -93,31 +100,31 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
     )
     losses['image_recon'] = phase_config['reconstruction_weight']*(mse_loss + 0.05*perceptual_loss_val + 0.1*identity_loss)
 
-    if target_attributes is not None:
-        bce_loss = F.binary_cross_entropy(
-            outputs['recon_text_probs'],
-            target_attributes,
-            reduction='none'
-        )
-
-        penalized_loss = torch.where(
-            bce_loss>0.15,
-            bce_loss*8.0,
-            bce_loss
-        )
-
-        text_attr_loss = F.binary_cross_entropy(
-            outputs['recon_text_probs'],
-            target_attributes
-        )
-
-        losses['text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
-
-        img2text_attr_loss = F.binary_cross_entropy(
-            outputs['text_from_image_probs'],
-            target_attributes
-        )
-        losses['text_from_image'] = phase_config['cross_modal_weight'] * img2text_attr_loss
+    #if target_attributes is not None:
+        # bce_loss = F.binary_cross_entropy(
+        #     outputs['recon_text_probs'],
+        #     target_attributes,
+        #     reduction='none'
+        # )
+        #
+        # penalized_loss = torch.where(
+        #     bce_loss>0.15,
+        #     bce_loss*8.0,
+        #     bce_loss
+        # )
+        #
+        # text_attr_loss = F.binary_cross_entropy(
+        #     outputs['recon_text_probs'],
+        #     target_attributes
+        # )
+        #
+        # losses['text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
+        #
+        # img2text_attr_loss = F.binary_cross_entropy(
+        #     outputs['text_from_image_probs'],
+        #     target_attributes
+        # )
+        # losses['text_from_image'] = phase_config['cross_modal_weight'] * img2text_attr_loss
 
     attr_consistency_loss = F.mse_loss(
         outputs['recon_text_probs'],
@@ -179,7 +186,7 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
     losses['total_loss'] = total_loss.item()
     return {k:(v.item() if isinstance(v,torch.Tensor) else v) for k,v in losses.items()}
 
-def validate(model, discriminator, val_loader, device, epoch, phase_config):
+def validate(model, discriminator, val_loader, device, epoch, phase_config, clip_tokenizer):
     model.eval()
     discriminator.eval()
     metrics = {
@@ -202,8 +209,15 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config):
     with torch.no_grad():
         for batch in val_loader:
             num_batches+=1
+
             images = batch['image'].to(device)
-            target_attributes = batch['attributes'].to(device)
+            if phase_config['dataset'] == 'CelebAMask-HQ':
+                target_attributes = batch['attributes'].to(device)
+            elif phase_config['dataset'] == 'Flickr30k':
+                text = batch["caption"]
+                input_tokens = clip_tokenizer(text).to(device)
+                target_attributes = input_tokens['input_ids'].to(torch.float)
+
 
             outputs = model(images=images, target_attributes=target_attributes)
 
@@ -219,22 +233,22 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config):
             )
             metrics['val_image_recon_loss'] += phase_config['reconstruction_weight']*(mse_loss+0.05*perceptual_loss_val+0.1*identity_loss).item()
 
-            text_attr_loss = F.binary_cross_entropy(
-                outputs['recon_text_probs'],
-                target_attributes
-            )
-            metrics['val_text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
+            # text_attr_loss = F.binary_cross_entropy(
+            #     outputs['recon_text_probs'],
+            #     target_attributes
+            # )
+            #metrics['val_text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
 
             pred_attributes = (outputs['recon_text_probs']>0.5).float()
             accuracy = (pred_attributes == target_attributes).float().mean()
             metrics['val_attribute_accuracy'] += accuracy.item()
 
-            if 'text_from_image_probs' in outputs:
-                img2text_attr_loss = F.binary_cross_entropy(
-                    outputs['text_from_image_probs'],
-                    target_attributes
-                )
-                metrics['val_text_from_image_loss'] += (phase_config['cross_modal_weight']*img2text_attr_loss).item()
+            # if 'text_from_image_probs' in outputs:
+            #     img2text_attr_loss = F.binary_cross_entropy(
+            #         outputs['text_from_image_probs'],
+            #         target_attributes
+            #     )
+            #     metrics['val_text_from_image_loss'] += (phase_config['cross_modal_weight']*img2text_attr_loss).item()
 
             if 'image_from_text' in outputs:
                 txt_target_feats = model.vgg(images)
@@ -301,9 +315,10 @@ def evaluate_model(model, discriminator, test_loader, device, epoch, phase_confi
             break
     return metrics
 
-def train_phase_1(model, discriminator, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch):
+def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
     print("\nStarting Phase 1: Early Training")
     phase_config = config['phase_configs'][1]
+    phase_config['dataset']=config['dataset']
     best_val_loss = float('inf')
     best_epoch=0
 
@@ -312,21 +327,21 @@ def train_phase_1(model, discriminator, train_loader, val_loader, optimizer_G, o
             model.train()
             discriminator.train()
             train_metrics=defaultdict(float)
-            for batch in tqdm(train_loader, desc=f"Phase 1 - Epoch {epoch+1}/{num_epochs}"):
-                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config)
-                for k,v in metrics.items():
-                    train_metrics[k]+=v
-            train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
+            # for batch in tqdm(train_loader, desc=f"Phase 1 - Epoch {epoch+1}/{num_epochs}"):
+            #     metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer)
+            #     for k,v in metrics.items():
+            #         train_metrics[k]+=v
+            # train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
 
-            val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config)
+            val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config, clip_tokenizer)
             if val_metrics['val_total_loss']<best_val_loss:
                 best_val_loss=val_metrics['val_total_loss']
                 best_epoch=epoch
 
             if (epoch+1)%config['eval_freq']==0:
                 eval_metrics = evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config)
-                from visualization import visualize_results
-                results_dir = visualize_results(model,val_subset,epoch+1,"phase1",num_samples=config['num_vis_samples'],device=device)
+                from src.visualization import visualize_results
+                results_dir = visualize_results(kl_coef, model,val_subset,epoch+1,"phase1",num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 1 - Visualization results saved to {results_dir}")
 
             combined_metrics = {
@@ -351,7 +366,7 @@ def train_phase_1(model, discriminator, train_loader, val_loader, optimizer_G, o
         trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=1)
     return best_val_loss,best_epoch
 
-def train_phase_2(model, discriminator, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch):
+def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
     print("\nStarting Phase 2: Middle Training")
     phase_config = config['phase_configs'][2]
     best_val_loss=float('inf')
@@ -364,7 +379,7 @@ def train_phase_2(model, discriminator, train_loader, val_loader, optimizer_G, o
 
             train_metrics=defaultdict(float)
             for batch in tqdm(train_loader, desc=f"Phase 2 - Epoch {epoch+1}/{num_epochs}"):
-                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config)
+                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config,clip_tokenizer)
                 for k,v in metrics.items():
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
@@ -376,8 +391,8 @@ def train_phase_2(model, discriminator, train_loader, val_loader, optimizer_G, o
 
             if (epoch+1)%config['eval_freq']==0:
                 eval_metrics=evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config)
-                from visualization import visualize_results
-                results_dir = visualize_results(model,val_subset,epoch+1,"phase2",num_samples=config['num_vis_samples'],device=device)
+                from src.visualization import visualize_results
+                results_dir = visualize_results(kl_coef, model,val_subset,epoch+1,"phase2",num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 2 - Visualization results saved to {results_dir}")
 
             combined_metrics={
@@ -402,7 +417,7 @@ def train_phase_2(model, discriminator, train_loader, val_loader, optimizer_G, o
         trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=2)
     return best_val_loss,best_epoch
 
-def train_phase_3(model, discriminator, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch):
+def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
     print("\nStarting Phase 3: Late Training")
     phase_config = config['phase_configs'][3]
     best_val_loss=float('inf')
@@ -415,7 +430,7 @@ def train_phase_3(model, discriminator, train_loader, val_loader, optimizer_G, o
 
             train_metrics=defaultdict(float)
             for batch in tqdm(train_loader, desc=f"Phase 3 - Epoch {epoch+1}/{num_epochs}"):
-                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config)
+                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer)
                 for k,v in metrics.items():
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
@@ -427,8 +442,8 @@ def train_phase_3(model, discriminator, train_loader, val_loader, optimizer_G, o
 
             if (epoch+1)%config['eval_freq']==0:
                 eval_metrics = evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config)
-                from visualization import visualize_results
-                results_dir=visualize_results(model,val_subset,epoch+1,"phase3",num_samples=config['num_vis_samples'],device=device)
+                from src.visualization import visualize_results
+                results_dir=visualize_results(kl_coef, model,val_subset,epoch+1,"phase3",num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 3 - Visualization results saved to {results_dir}")
 
             combined_metrics={
@@ -453,9 +468,9 @@ def train_phase_3(model, discriminator, train_loader, val_loader, optimizer_G, o
         trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=3)
     return best_val_loss,best_epoch
 
-def run_phased_training(model, discriminator, train_loader, val_loader, optimizer_G, optimizer_D,
+def run_phased_training(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D,
                        device, config, trainer, val_subset, phase1_epochs, phase2_epochs, phase3_epochs,
-                       phase1_start=0, phase2_start=0, phase3_start=0):
+                       phase1_start=0, phase2_start=0, phase3_start=0, kl_coef=1):
 
     total_epochs=phase1_epochs+phase2_epochs+phase3_epochs
     print(f"\nStarting phased training:")
@@ -469,8 +484,8 @@ def run_phased_training(model, discriminator, train_loader, val_loader, optimize
     if phase1_epochs>0:
         print(f"\nPhase 1: Early Training (Reconstruction Focus)")
         phase1_loss,phase1_best = train_phase_1(
-            model,discriminator,train_loader,val_loader,optimizer_G,optimizer_D,
-            device,phase1_epochs,trainer,config,val_subset,phase1_start
+            model,discriminator, clip_tokenizer, train_loader,val_loader,optimizer_G,optimizer_D,
+            device,phase1_epochs,trainer,config,val_subset,phase1_start, kl_coef
         )
         print(f"\nPhase 1 completed. Best loss: {phase1_loss:.4f} at epoch {phase1_best+1}")
         best_losses.append(phase1_loss)
@@ -478,8 +493,8 @@ def run_phased_training(model, discriminator, train_loader, val_loader, optimize
     if phase2_epochs>0:
         print(f"\nPhase 2: Middle Training (Alignment Focus)")
         phase2_loss,phase2_best = train_phase_2(
-            model,discriminator,train_loader,val_loader,optimizer_G,optimizer_D,
-            device,phase2_epochs,trainer,config,val_subset,phase2_start
+            model,discriminator, clip_tokenizer, train_loader,val_loader,optimizer_G,optimizer_D,
+            device,phase2_epochs,trainer,config,val_subset,phase2_start, kl_coef
         )
         print(f"\nPhase 2 completed. Best loss: {phase2_loss:.4f} at epoch {phase2_best+1}")
         best_losses.append(phase2_loss)
@@ -487,8 +502,8 @@ def run_phased_training(model, discriminator, train_loader, val_loader, optimize
     if phase3_epochs>0:
         print(f"\nPhase 3: Late Training (Refinement Focus)")
         phase3_loss,phase3_best = train_phase_3(
-            model,discriminator,train_loader,val_loader,optimizer_G,optimizer_D,
-            device,phase3_epochs,trainer,config,val_subset,phase3_start
+            model,discriminator, clip_tokenizer, train_loader,val_loader,optimizer_G,optimizer_D,
+            device,phase3_epochs,trainer,config,val_subset,phase3_start, kl_coef
         )
         print(f"\nPhase 3 completed. Best loss: {phase3_loss:.4f} at epoch {phase3_best+1}")
         best_losses.append(phase3_loss)
