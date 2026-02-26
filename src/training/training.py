@@ -7,6 +7,15 @@ import torch.nn.functional as F
 from collections import defaultdict
 from tqdm import tqdm
 
+from pycocoevalcap.bleu.bleu import Bleu
+from pycocoevalcap.rouge.rouge import Rouge
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.meteor.meteor import Meteor
+from pycocoevalcap.spice.spice import Spice
+
+from torchmetrics.text import ROUGEScore, BLEUScore
+
+
 from .losses import (
     discriminator_loss, generator_loss, generator_loss_eval,
     discriminator_loss_eval, compute_distribution_matching_loss,
@@ -14,20 +23,54 @@ from .losses import (
 )
 from ..visualization.viz import visualize_results
 
+def flatten_extend(matrix):
+    flat_list = []
+    for row in matrix:
+         flat_list.extend(row)
+    return flat_list
+
+def evaluate_all_metrics(gts, res):
+    scores = {}
+
+    # BLEU (1–4)
+    bleu_scorer = Bleu(4)
+    bleu, bleu_ind = bleu_scorer.compute_score(gts, res)
+    scores['BLEU'] = bleu  # list of 4 BLEU scores
+
+    # METEOR
+    meteor, meteor_ind = Meteor().compute_score(gts, res)
+    scores['METEOR'] = meteor
+
+    # ROUGE-L
+    rouge, rouge_ind = Rouge().compute_score(gts, res)
+    scores['ROUGE_L'] = rouge
+
+    # CIDEr
+    cider, cider_ind = Cider().compute_score(gts, res)
+    scores['CIDEr'] = cider
+
+    # SPICE (requires Java 8!)
+    spice, spice_ind = Spice().compute_score(gts, res)
+    scores['SPICE'] = spice
+
+    return scores
+
+
 class TrainingManager:
-    def __init__(self, kl_coef, save_dir='training'):
+    def __init__(self, kl_coef, lr, save_dir='training'):
         self.save_dir = save_dir
         os.makedirs(save_dir,exist_ok=True)
-        self.history_path = os.path.join(save_dir,'history_'+str(kl_coef)+'.csv')
+        self.history_path = os.path.join(save_dir,'history_'+str(kl_coef)+'_lr_'+str(lr)+'.csv')
         self.history=[]
-        self.info_path = os.path.join(save_dir,'run_info_'+str(kl_coef)+'.json')
+        self.info_path = os.path.join(save_dir,'run_info_'+str(kl_coef)+'_lr_'+str(lr)+'.json')
         self.kl_coef=kl_coef
+        self.lr=lr
 
 
     def save_checkpoint(self, epoch, model, discriminator, optimizer_G, optimizer_D, loss, phase):
-        phase_checkpoint_dir = os.path.join(self.save_dir, 'checkpoints', str(self.kl_coef), f'phase{phase}')
+        phase_checkpoint_dir = os.path.join(self.save_dir, 'checkpoints', str(self.kl_coef)+'_lr_'+str(self.lr)+'_', f'phase{phase}')
         os.makedirs(phase_checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(phase_checkpoint_dir,f'checkpoint_epoch_{epoch}_kl_coef_{self.kl_coef}.pt')
+        checkpoint_path = os.path.join(phase_checkpoint_dir,f'checkpoint_epoch_{epoch}_kl_coef_{self.kl_coef}_lr_{self.lr}.pt')
         torch.save({
             'epoch':epoch,
             'model_state_dict':model.state_dict(),
@@ -58,12 +101,21 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
     images = batch['image'].to(device)
     if phase_config['dataset']=='CelebAMask-HQ':
         target_attributes = batch['attributes'].to(device) if 'attributes' in batch else None
+        attention_mask=0
     elif phase_config['dataset']=='Flickr30k':
         text = batch["caption"]
         input_tokens = clip_tokenizer(text).to(device)
-        target_attributes = input_tokens['input_ids'].to(torch.float)
+        target_attributes = input_tokens['input_ids']
+        attention_mask = input_tokens['attention_mask']
 
-    outputs = model(images=images, target_attributes=target_attributes)
+
+    outputs = model(True, images=images, target_attributes=target_attributes, attention_mask=attention_mask)
+
+    # if phase_config['dataset'] == 'Flickr30k':
+    #     pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1).float()
+    #
+    #     pred_ids_text2img = torch.argmax(outputs['text_from_image_probs'], dim=-1).float()
+
 
     losses = {}
 
@@ -100,7 +152,7 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
     )
     losses['image_recon'] = phase_config['reconstruction_weight']*(mse_loss + 0.05*perceptual_loss_val + 0.1*identity_loss)
 
-    #if target_attributes is not None:
+    if target_attributes is not None:
         # bce_loss = F.binary_cross_entropy(
         #     outputs['recon_text_probs'],
         #     target_attributes,
@@ -112,24 +164,47 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
         #     bce_loss*8.0,
         #     bce_loss
         # )
-        #
-        # text_attr_loss = F.binary_cross_entropy(
-        #     outputs['recon_text_probs'],
-        #     target_attributes
-        # )
-        #
-        # losses['text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
-        #
-        # img2text_attr_loss = F.binary_cross_entropy(
-        #     outputs['text_from_image_probs'],
-        #     target_attributes
-        # )
-        # losses['text_from_image'] = phase_config['cross_modal_weight'] * img2text_attr_loss
 
-    attr_consistency_loss = F.mse_loss(
-        outputs['recon_text_probs'],
-        outputs['text_from_image_probs']
-    )
+
+
+
+        if phase_config['dataset']=='CelebAMask-HQ':
+            text_attr_loss = F.binary_cross_entropy(
+                outputs['recon_text_probs'],
+                target_attributes
+            )
+
+            img2text_attr_loss = F.binary_cross_entropy(
+                outputs['text_from_image_probs'],
+                target_attributes
+            )
+
+        elif phase_config['dataset']=='Flickr30k':
+            text_attr_loss = F.cross_entropy(
+                outputs['recon_text_probs'].view(-1, outputs['recon_text_probs'].size(-1)),
+                target_attributes.view(-1)
+            )
+
+            img2text_attr_loss = F.cross_entropy(
+                outputs['text_from_image_probs'].view(-1, outputs['text_from_image_probs'].size(-1)),
+                target_attributes.view(-1)
+            )
+
+
+        losses['text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
+
+
+
+        losses['text_from_image'] = phase_config['cross_modal_weight'] * img2text_attr_loss
+
+        attr_consistency_loss = F.mse_loss(
+            outputs['recon_text_probs'],
+            outputs['text_from_image_probs']
+        )
+
+
+
+
     losses['attr_consistency'] = phase_config['consistency_weight']*attr_consistency_loss
 
     if 'image_from_text' in outputs:
@@ -164,19 +239,19 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
     if 'consistency_score' in outputs:
         losses['consistency'] = phase_config['consistency_weight']*(1-outputs['consistency_score'].mean())
 
-    if target_attributes is not None and phase_config['attribute_weight']>0:
-        if 'image_attributes' in outputs:
-            losses['image_attribute_loss'] = phase_config['attribute_weight'] * F.binary_cross_entropy_with_logits(
-                outputs['image_attributes'],
-                target_attributes
-            )
-
-    if target_attributes is not None and phase_config['attribute_weight']>0:
-        if 'text_attributes' in outputs:
-            losses['text_attribute_loss'] = phase_config['attribute_weight']*F.binary_cross_entropy_with_logits(
-                outputs['text_attributes'],
-                target_attributes
-            )
+    # if target_attributes is not None and phase_config['attribute_weight']>0:
+    #     if 'image_attributes' in outputs:
+    #         losses['image_attribute_loss'] = phase_config['attribute_weight'] * F.binary_cross_entropy_with_logits(
+    #             outputs['image_attributes'],
+    #             target_attributes
+    #         )
+    #
+    # if target_attributes is not None and phase_config['attribute_weight']>0:
+    #     if 'text_attributes' in outputs:
+    #         losses['text_attribute_loss'] = phase_config['attribute_weight']*F.binary_cross_entropy_with_logits(
+    #             outputs['text_attributes'],
+    #             target_attributes
+    #         )
 
     total_loss = sum(losses.values())
     total_loss.backward()
@@ -206,6 +281,10 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
     }
 
     num_batches=0
+    caption_pred_list=[]
+    caption_gt_list_tot=[]
+
+
     with torch.no_grad():
         for batch in val_loader:
             num_batches+=1
@@ -213,13 +292,27 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
             images = batch['image'].to(device)
             if phase_config['dataset'] == 'CelebAMask-HQ':
                 target_attributes = batch['attributes'].to(device)
+                attention_mask=0
             elif phase_config['dataset'] == 'Flickr30k':
                 text = batch["caption"]
                 input_tokens = clip_tokenizer(text).to(device)
-                target_attributes = input_tokens['input_ids'].to(torch.float)
+                target_attributes = input_tokens['input_ids']
+                attention_mask = input_tokens['attention_mask']
 
+            outputs = model(False, images=images, target_attributes=target_attributes, attention_mask=attention_mask)
 
-            outputs = model(images=images, target_attributes=target_attributes)
+            if phase_config['dataset'] == 'Flickr30k':
+
+                pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1)
+                pred_ids_text2img = torch.argmax(outputs['recon_text_probs'], dim=-1)
+
+                pred_ids_list = pred_ids.detach().cpu().tolist()
+
+                caption_pred = [
+                    clip_tokenizer.decode(ids, skip_special_tokens=True)
+                    #clip_tokenizer.decode(ids)
+                    for ids in pred_ids_list
+                ]
 
             with torch.no_grad():
                 target_feats = model.vgg(images)
@@ -233,22 +326,48 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
             )
             metrics['val_image_recon_loss'] += phase_config['reconstruction_weight']*(mse_loss+0.05*perceptual_loss_val+0.1*identity_loss).item()
 
-            # text_attr_loss = F.binary_cross_entropy(
-            #     outputs['recon_text_probs'],
-            #     target_attributes
-            # )
-            #metrics['val_text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
 
-            pred_attributes = (outputs['recon_text_probs']>0.5).float()
-            accuracy = (pred_attributes == target_attributes).float().mean()
-            metrics['val_attribute_accuracy'] += accuracy.item()
+            if phase_config['dataset'] == 'CelebAMask-HQ':
 
-            # if 'text_from_image_probs' in outputs:
-            #     img2text_attr_loss = F.binary_cross_entropy(
-            #         outputs['text_from_image_probs'],
-            #         target_attributes
-            #     )
-            #     metrics['val_text_from_image_loss'] += (phase_config['cross_modal_weight']*img2text_attr_loss).item()
+                text_attr_loss = F.binary_cross_entropy(
+                    outputs['recon_text_probs'],
+                    target_attributes
+                )
+
+            elif phase_config['dataset'] == 'Flickr30k':
+
+                # print(outputs['embedded_tokens'].size())
+                # print(outputs['recon_text_probs'].size())
+
+                text_attr_loss = F.cross_entropy(
+                    outputs['recon_text_probs'].view(-1, outputs['recon_text_probs'].size(-1)),
+                    target_attributes.view(-1)
+                )
+
+
+            metrics['val_text_recon_loss'] = phase_config['text_reconstruction_weight'] * text_attr_loss
+
+            if phase_config['dataset'] == 'CelebAMask-HQ':
+                pred_attributes = (outputs['recon_text_probs']>0.5).float()
+                accuracy = (pred_attributes == target_attributes).float().mean()
+                metrics['val_attribute_accuracy'] += accuracy.item()
+
+            if 'text_from_image_probs' in outputs:
+
+                if phase_config['dataset'] == 'CelebAMask-HQ':
+                    img2text_attr_loss = F.binary_cross_entropy(
+                        outputs['text_from_image_probs'],
+                        target_attributes
+                    )
+
+                elif phase_config['dataset'] == 'Flickr30k':
+                    img2text_attr_loss = F.cross_entropy(
+                        outputs['text_from_image_probs'].view(-1, outputs['text_from_image_probs'].size(-1)),
+                        target_attributes.view(-1)
+                    )
+
+
+                metrics['val_text_from_image_loss'] += (phase_config['cross_modal_weight']*img2text_attr_loss).item()
 
             if 'image_from_text' in outputs:
                 txt_target_feats = model.vgg(images)
@@ -293,29 +412,110 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
                 adv_loss = phase_config['adversarial_weight']*generator_loss_eval(discriminator, outputs['recon_images'])
                 metrics['val_adversarial_loss'] += adv_loss.item()
 
+            if phase_config['dataset'] == 'Flickr30k':
+
+                # embedding_weights = F.normalize(model.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)
+                # #embedding_weights = F.normalize(model.text_encoder.base.embeddings.word_embeddings.weight,dim=0)
+                # logits = torch.matmul(F.normalize(outputs['recon_text_probs'], dim=-1),embedding_weights.T)  # (batch, seq_len, vocab_size)
+                # pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1)
+                #
+                # pred_ids_list = pred_ids.detach().cpu().tolist()
+                #
+                # caption_pred = [
+                #     clip_tokenizer.decode(ids, skip_special_tokens=True)
+                #     #clip_tokenizer.decode(ids)
+                #     for ids in pred_ids_list
+                # ]
+
+                ####coco metrics
+                caption_pred_list.extend([[x] for x in caption_pred])
+
+                caption_gt_list = [[] for i in range(len(images))]
+
+                caption_gt = tuple(text)
+                for j in range(len(caption_gt)):
+                    caption_gt_list[j].append(caption_gt[j])
+
+
+                caption_gt_list_tot.extend(caption_gt_list)
+
+    evaluation_metrics_dict=metrics_evaluation(num_batches, caption_pred_list, caption_gt_list_tot, caption_pred, images.size()[0])
+
     metrics = {k:v/num_batches for k,v in metrics.items()}
     metrics['val_total_loss'] = sum(v for k,v in metrics.items() if k not in ['val_attribute_accuracy','val_key_attribute_accuracy'])
+    metrics.update(evaluation_metrics_dict)
+
     return metrics
 
-def evaluate_model(model, discriminator, test_loader, device, epoch, phase_config):
+def metrics_evaluation(batch_idx, caption_pred_list, caption_gt_list_tot, caption_pred, batch_size):
+
+    rouge = ROUGEScore()
+    bleu = BLEUScore()
+
+    temp = list(range((batch_idx) * batch_size + (len(caption_pred))))
+
+    caption_zip = zip(temp, caption_pred_list)
+    caption_pred_dict = dict(caption_zip)
+
+    caption_gt_zip = zip(temp, caption_gt_list_tot)
+    caption_gt_dict = dict(caption_gt_zip)
+
+    scores = evaluate_all_metrics(caption_gt_dict, caption_pred_dict)
+    for k, v in scores.items():
+        print(k, v)
+
+    scores_list = list(scores.values())
+    bleu1_score = scores_list[0][0]
+    bleu2_score = scores_list[0][1]
+    bleu3_score = scores_list[0][2]
+    bleu4_score = scores_list[0][3]
+    meteor_score = scores_list[1]
+    rouge_L_score = scores_list[2]
+    cider_score = scores_list[3]
+    spice_score = scores_list[4]
+
+    caption_pred_list_ext = flatten_extend(caption_pred_list)
+    caption_gt_list_ext = flatten_extend(caption_gt_list_tot)
+    bleu_score = bleu(caption_pred_list_ext, caption_gt_list_ext)
+    rouge_score = rouge(caption_pred_list_ext, caption_gt_list_ext)
+
+    rouge_l = float(rouge_score['rougeL_fmeasure'])
+    bleu = float(bleu_score)
+
+    return {'bleu1_score':bleu1_score,'bleu2_score':bleu2_score, 'bleu3_score':bleu3_score, 'bleu4_score':bleu4_score,
+            'meteor_score':meteor_score, 'rouge_L_score':rouge_L_score, 'cider_score':cider_score, 'spice_score':spice_score,
+             'rouge_l_torchmetrics':rouge_l, 'bleu_torchmetrics':bleu}
+
+def evaluate_model(model, discriminator, test_loader, device, epoch, phase_config, clip_tokenizer):
     model.eval()
-    metrics = validate(model, discriminator, test_loader, device, epoch, phase_config)
+    metrics = validate(model, discriminator, test_loader, device, epoch, phase_config, clip_tokenizer)
 
     with torch.no_grad():
         for batch in test_loader:
             images = batch['image'].to(device)
-            target_attributes = batch['attributes'].to(device)
-            outputs = model(images=images, target_attributes=target_attributes)
-            pred_attributes = (outputs['text_from_image_probs']>0.5).float()
-            per_attr_acc = (pred_attributes == target_attributes).float().mean(dim=0)
-            print("\nPer-Attribute Accuracy:")
-            for idx, acc in enumerate(per_attr_acc):
-                attr_name = model.idx_to_attribute[idx].replace('_',' ')
-                print(f"{attr_name}: {acc.item():.4f}")
-            break
+
+            if phase_config['dataset'] == 'CelebAMask-HQ':
+                target_attributes = batch['attributes'].to(device)
+            elif phase_config['dataset'] == 'Flickr30k':
+                text = batch["caption"]
+                input_tokens = clip_tokenizer(text).to(device)
+                target_attributes = input_tokens['input_ids']
+
+
+            outputs = model(False, images=images, target_attributes=target_attributes)
+
+            if phase_config['dataset'] == 'CelebAMask-HQ':
+                pred_attributes = (outputs['text_from_image_probs']>0.5).float()
+                per_attr_acc = (pred_attributes == target_attributes).float().mean(dim=0)
+                print("\nPer-Attribute Accuracy:")
+                for idx, acc in enumerate(per_attr_acc):
+                    attr_name = model.idx_to_attribute[idx].replace('_',' ')
+                    print(f"{attr_name}: {acc.item():.4f}")
+                break
     return metrics
 
-def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
+def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer,
+                  config, val_subset, start_epoch, kl_coef):
     print("\nStarting Phase 1: Early Training")
     phase_config = config['phase_configs'][1]
     phase_config['dataset']=config['dataset']
@@ -327,11 +527,11 @@ def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader
             model.train()
             discriminator.train()
             train_metrics=defaultdict(float)
-            # for batch in tqdm(train_loader, desc=f"Phase 1 - Epoch {epoch+1}/{num_epochs}"):
-            #     metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer)
-            #     for k,v in metrics.items():
-            #         train_metrics[k]+=v
-            # train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
+            for batch in tqdm(train_loader, desc=f"Phase 1 - Epoch {epoch+1}/{num_epochs}"):
+                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer)
+                for k,v in metrics.items():
+                    train_metrics[k]+=v
+            train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
 
             val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config, clip_tokenizer)
             if val_metrics['val_total_loss']<best_val_loss:
@@ -339,9 +539,11 @@ def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader
                 best_epoch=epoch
 
             if (epoch+1)%config['eval_freq']==0:
-                eval_metrics = evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config)
+                if phase_config['dataset'] == 'CelebAMask-HQ':
+                    eval_metrics = evaluate_model(model, discriminator, val_loader, device, epoch + 1, phase_config,clip_tokenizer)
                 from src.visualization import visualize_results
-                results_dir = visualize_results(kl_coef, model,val_subset,epoch+1,"phase1",num_samples=config['num_vis_samples'],device=device)
+                results_dir = visualize_results(phase_config['dataset'], clip_tokenizer, kl_coef, optimizer_G.param_groups[0]['lr'],
+                                                model,val_subset,epoch+1,"phase1",num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 1 - Visualization results saved to {results_dir}")
 
             combined_metrics = {
@@ -369,6 +571,8 @@ def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader
 def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
     print("\nStarting Phase 2: Middle Training")
     phase_config = config['phase_configs'][2]
+    phase_config['dataset'] = config['dataset']
+
     best_val_loss=float('inf')
     best_epoch=0
 
@@ -384,15 +588,17 @@ def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
 
-            val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config)
+            val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config, clip_tokenizer)
             if val_metrics['val_total_loss']<best_val_loss:
                 best_val_loss=val_metrics['val_total_loss']
                 best_epoch=epoch
 
             if (epoch+1)%config['eval_freq']==0:
-                eval_metrics=evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config)
+                if phase_config['dataset']=='CelebAMask-HQ':
+                    eval_metrics=evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config, clip_tokenizer)
                 from src.visualization import visualize_results
-                results_dir = visualize_results(kl_coef, model,val_subset,epoch+1,"phase2",num_samples=config['num_vis_samples'],device=device)
+                results_dir = visualize_results(phase_config['dataset'], clip_tokenizer, kl_coef, optimizer_G.param_groups[0]['lr'],
+                                                model,val_subset,epoch+1,"phase2",num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 2 - Visualization results saved to {results_dir}")
 
             combined_metrics={
@@ -420,6 +626,8 @@ def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader
 def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
     print("\nStarting Phase 3: Late Training")
     phase_config = config['phase_configs'][3]
+    phase_config['dataset'] = config['dataset']
+
     best_val_loss=float('inf')
     best_epoch=0
 
@@ -435,15 +643,17 @@ def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loade
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
 
-            val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config)
+            val_metrics=validate(model,discriminator,val_loader,device,epoch,phase_config, clip_tokenizer)
             if val_metrics['val_total_loss']<best_val_loss:
                 best_val_loss=val_metrics['val_total_loss']
                 best_epoch=epoch
 
             if (epoch+1)%config['eval_freq']==0:
-                eval_metrics = evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config)
+                if phase_config['dataset'] == 'CelebAMask-HQ':
+                    eval_metrics = evaluate_model(model, discriminator, val_loader, device, epoch + 1, phase_config, clip_tokenizer)
                 from src.visualization import visualize_results
-                results_dir=visualize_results(kl_coef, model,val_subset,epoch+1,"phase3",num_samples=config['num_vis_samples'],device=device)
+                results_dir=visualize_results(phase_config['dataset'], clip_tokenizer, kl_coef, optimizer_G.param_groups[0]['lr'],
+                                              model,val_subset,epoch+1,"phase3",num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 3 - Visualization results saved to {results_dir}")
 
             combined_metrics={

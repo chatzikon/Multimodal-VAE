@@ -1,8 +1,13 @@
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
 import torch
 import numpy as np
 import random
 from torch.utils.data import DataLoader
+
+from typing import Dict
 
 from src.config import config
 from src.data import get_celeba_subset, CelebADataset, custom_collate_fn, custom_collate_fn_flickr, visualize_dataset_samples
@@ -11,12 +16,12 @@ from src.training import run_phased_training, TrainingManager
 from src.visualization import visualize_results
 from clip_dl import Flickr30kDataset
 from transformers import AutoModel, AutoTokenizer, BertTokenizer
-
+import warnings
 
 import gc
 
 class Tokenizer:
-    def __init__(self, max_length, tokenizer: BertTokenizer) -> None:
+    def __init__(self, max_length, tokenizer) -> None:
         self.tokenizer = tokenizer
         self.max_length=max_length
 
@@ -32,12 +37,15 @@ class Tokenizer:
     def decode(self, token_ids, **kwargs):
         return self.tokenizer.decode(token_ids, **kwargs)
 
-def main(kl_coef):
+
+
+
+def main(kl_coef, lr_G,lr_D):
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     random.seed(config['seed'])
-    #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    device='cpu'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #device='cpu'
     print(f"Using device: {device}")
 
     kl_coef_init=np.ones(3)
@@ -47,13 +55,26 @@ def main(kl_coef):
         kl_coef_init[i] = config['phase_configs'][i + 1]['kl_weight']
         config['phase_configs'][i+1]['kl_weight']*=kl_coef
 
+    config['learning_rate_G']=lr_G
+    config['learning_rate_D'] = lr_D
+
     if config['dataset']=='CelebAMask-HQ':
 
-        model = MultimodalVAE(dataset=config['dataset'], latent_dim=config['latent_dim'], temperature=1.0).to(device)
+        clip_tokenizer=None
+        vocab_size=0
+
+        model = MultimodalVAE(vocab_size, dataset=config['dataset'], latent_dim=config['latent_dim'], temperature=1.0).to(device)
 
     elif config['dataset'] == 'Flickr30k':
 
-        model = MultimodalVAE(dataset=config['dataset'], latent_dim=config['latent_dim'], num_attributes=config['max_length'], temperature=1.0).to(device)
+        clip_tokenizer = Tokenizer(config['max_length'],
+                                   #AutoTokenizer.from_pretrained("distilbert-base-multilingual-cased"))
+                                   AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32"))
+
+        #vocab_size = clip_tokenizer.tokenizer.vocab_size
+
+        model = MultimodalVAE(device, clip_tokenizer, dataset=config['dataset'],  latent_dim=config['latent_dim'], num_attributes=config['max_length'],
+                                temperature=1.0).to(device)
 
 
     discriminator = PatchDiscriminator(in_channels=3, ndf=64).to(device)
@@ -112,7 +133,6 @@ def main(kl_coef):
             collate_fn=custom_collate_fn
         )
 
-        clip_tokenizer=None
 
 
     elif config['dataset']=='Flickr30k':
@@ -129,9 +149,9 @@ def main(kl_coef):
 
         visualize_dataset_samples(train_subset, num_samples=5, save_path='dataset_samples.png')
 
-        clip_tokenizer = Tokenizer(config['max_length'], AutoTokenizer.from_pretrained("distilbert-base-multilingual-cased"))
 
-    trainer = TrainingManager(kl_coef)
+
+    trainer = TrainingManager(kl_coef, lr_G)
 
     phase1_epochs = config['phase1_epochs']
     phase2_epochs = config['phase2_epochs']
@@ -185,7 +205,7 @@ def main(kl_coef):
     )
 
     print(f"\nTraining completed! Best validation loss: {best_loss:.4f}")
-    final_checkpoint_path = 'checkpoints/final_model_kl_coef_'+str(kl_coef)+'.pt'
+    final_checkpoint_path = 'checkpoints/final_model_kl_coef_'+str(kl_coef)+'_lr_'+str(lr_G)+'.pt'
     torch.save({
         'model_state_dict':model.state_dict(),
         'discriminator_state_dict':discriminator.state_dict(),
@@ -196,6 +216,10 @@ def main(kl_coef):
     }, final_checkpoint_path)
     print(f"Final model saved to: {final_checkpoint_path}")
 
+    model = model.cpu()
+    discriminator = discriminator.cpu()
+    # optimizer_G = optimizer_G.cpu()
+    # optimizer_D=optimizer_D.cpu()
     del model
     del discriminator
     del optimizer_G
@@ -210,13 +234,23 @@ def main(kl_coef):
         config['phase_configs'][i+1]['kl_weight']=kl_coef_init[i]
         print(config['phase_configs'][i + 1]['kl_weight'])
 
+    from numba import cuda
+
+    cuda.select_device(0)  # choosing second GPU
+    cuda.close()
+
 
 
 if __name__ == "__main__":
 
-    kl_coef=[1000,500,400,300,200,100,10,1,1e-1,1e-2,1e-3]
+    #kl_coef=[1000,500,400,300,200,100,10,1,1e-1,1e-2,1e-3]
 
-    for i in range(len(kl_coef)):
-        main(kl_coef[i])
+    kl_coef=[1,10,50,1e-1]
+    #kl_coef = [10]
+    lr=[1e-5,1e-6]
+
+    for j in range(len(kl_coef)):
+        for i in range(len(lr)):
+            main(kl_coef[j], lr[i], lr[i]//10)
 
 

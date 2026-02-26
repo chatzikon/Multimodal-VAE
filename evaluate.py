@@ -13,28 +13,69 @@ import torch.nn.functional as F
 from textwrap import wrap
 import textwrap
 
+from transformers import  AutoTokenizer
+
+
 from src.config import config
 from src.data import CelebADataset, get_celeba_subset
 from src.models import MultimodalVAE
 from src.data.utils import clean_and_validate_attributes
 from src.visualization import VisualizationUtils
 
-def load_model_and_data(device, latent_dim, model_checkpoint='final_model.pt'):
+from clip_dl import Flickr30kDataset
+
+class Tokenizer:
+    def __init__(self, max_length, tokenizer) -> None:
+        self.tokenizer = tokenizer
+        self.max_length=max_length
+
+    def __call__(self, x: str) -> AutoTokenizer:
+        return self.tokenizer(
+            x,
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+    def decode(self, token_ids, **kwargs):
+        return self.tokenizer.decode(token_ids, **kwargs)
+
+
+def load_model_and_data(device, dataset, tokenizer, latent_dim, model_checkpoint='final_model.pt'):
+
     checkpoint = torch.load(model_checkpoint, map_location=device, weights_only=False)
-    model = MultimodalVAE(
-        latent_dim=latent_dim,
+
+    if dataset=='Flickr30k':
+        num_attributes=32
+    elif dataset=='CelebAMask-HQ':
+        num_attributes = 10
+
+
+    model = MultimodalVAE(device,tokenizer, dataset,
+        latent_dim=latent_dim, num_attributes=num_attributes,
         temperature=1.0
     ).to(device)
+
+    print(model)
+
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
 
-    test_dataset = get_celeba_subset(
-        root_dir=config['data_path'],
-        subset_size=5000,
-        random_subset=True,
-        cache_path=config['cache_path']
-    )
-    dataset = CelebADataset(test_dataset)
+    if dataset=='CelebAMask-HQ':
+        test_dataset = get_celeba_subset(
+            root_dir=config['data_path'],
+            subset_size=5000,
+            random_subset=True,
+            cache_path=config['cache_path']
+        )
+        dataset = CelebADataset(test_dataset)
+
+    elif dataset=='Flickr30k':
+        train_subset = Flickr30kDataset('train')
+        val_subset = Flickr30kDataset('validation')
+        dataset=[train_subset, val_subset]
+
     return model, dataset
     
 def visualize_random_examples(dataset, num_samples=5, save_dir='eval_results'):
@@ -585,7 +626,7 @@ def visualize_consistency_confusion_matrix(metrics, save_dir='eval_results'):
         'f1': f1
     }
 
-def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, save_dir='eval_results', perplexity=30):
+def visualize_paired_latent_spaces_2d(model, dataset, device, dataset_id, tokenizer, num_samples=200, save_dir='eval_results', perplexity=30):
     import os
     import numpy as np
     import torch
@@ -621,16 +662,25 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, s
         for i in range(min(num_samples, len(dataset))):
             sample = dataset[i]
             image = sample['image'].unsqueeze(0).to(device)
-            attrs = sample['attributes'].unsqueeze(0).to(device)
+            if dataset_id == 'CelebAMask-HQ':
+                attrs = sample['attributes'].unsqueeze(0).to(device)
+                attention_mask=0
+            elif dataset_id=='Flickr30k':
+                text = sample["caption"]
+                input_tokens = tokenizer(text).to(device)
+                attrs = input_tokens['input_ids'].unsqueeze(0).to(device)
+                attention_mask = input_tokens['attention_mask']
+
 
             z_img, _, _ = model.encode_image(image)
-            z_txt, _, _ = model.encode_text(attrs)
+            z_txt, _, _ = model.encode_text(attrs, attention_mask)
 
             z_images.append(z_img.cpu().numpy()[0])
             z_texts.append(z_txt.cpu().numpy()[0])
 
-            label = "male" if attrs[0, male_idx].item() == 1 else "female"
-            labels.append(label)
+            if dataset_id=='CelebAMask-HQ':
+                label = "male" if attrs[0, male_idx].item() == 1 else "female"
+                labels.append(label)
 
     z_images = np.array(z_images)
     z_texts = np.array(z_texts)
@@ -644,17 +694,28 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, s
 
     colors = {'male': '#2ecc71', 'female': '#e74c3c'}
 
-    # Plot image embeddings
-    for label in colors:
-        mask = np.array(labels) == label
+    if dataset_id == 'CelebAMask-HQ':
+        # Plot image embeddings
+        for label in colors:
+            mask = np.array(labels) == label
+            ax1.scatter(
+                z_img_tsne[mask, 0],
+                z_img_tsne[mask, 1],
+                c=colors[label],
+                label=f'Image ({label})',
+                alpha=0.7,
+                s=80
+            )
+    elif dataset_id=='Flickr30k':
         ax1.scatter(
-            z_img_tsne[mask, 0],
-            z_img_tsne[mask, 1],
-            c=colors[label],
-            label=f'Image ({label})',
+            z_img_tsne[:,0],
+            z_img_tsne[:,1],
+            #c=colors[label],
+            #label=f'Image ({label})',
             alpha=0.7,
             s=80
         )
+
     ax1.set_title('Image Embeddings', fontsize=16)
     ax1.set_xlabel('t-SNE 1', fontsize=14)
     ax1.set_ylabel('t-SNE 2', fontsize=14)
@@ -662,17 +723,29 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, s
     ax1.tick_params(axis='both', labelsize=12)
     ax1.grid(True, alpha=0.3)
 
-    # Plot text embeddings
-    for label in colors:
-        mask = np.array(labels) == label
+    if dataset_id == 'CelebAMask-HQ':
+        # Plot text embeddings
+        for label in colors:
+            mask = np.array(labels) == label
+            ax2.scatter(
+                z_txt_tsne[mask, 0],
+                z_txt_tsne[mask, 1],
+                c=colors[label],
+                label=f'Text ({label})',
+                alpha=0.7,
+                s=80
+            )
+    elif dataset_id=='Flickr30k':
         ax2.scatter(
-            z_txt_tsne[mask, 0],
-            z_txt_tsne[mask, 1],
-            c=colors[label],
-            label=f'Text ({label})',
+            z_txt_tsne[:, 0],
+            z_txt_tsne[:, 1],
+            #c=colors[label],
+            #label=f'Text ({label})',
             alpha=0.7,
             s=80
         )
+
+
     ax2.set_title('Text Embeddings', fontsize=16)
     ax2.set_xlabel('t-SNE 1', fontsize=14)
     ax2.set_ylabel('t-SNE 2', fontsize=14)
@@ -681,21 +754,38 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, num_samples=200, s
     ax2.grid(True, alpha=0.3)
 
     num_lines = min(30, num_samples)
-    for i in range(num_lines):
-        line_color = colors[labels[i]]
-        con = ConnectionPatch(
-            xyA=(z_img_tsne[i, 0], z_img_tsne[i, 1]),
-            xyB=(z_txt_tsne[i, 0], z_txt_tsne[i, 1]),
-            coordsA="data",
-            coordsB="data",
-            axesA=ax1,
-            axesB=ax2,
-            color=line_color,
-            alpha=0.4,
-            linestyle="--",
-            linewidth=0.8
-        )
-        fig.add_artist(con)
+
+    if dataset_id == 'CelebAMask-HQ':
+        for i in range(num_lines):
+            line_color = colors[labels[i]]
+            con = ConnectionPatch(
+                xyA=(z_img_tsne[i, 0], z_img_tsne[i, 1]),
+                xyB=(z_txt_tsne[i, 0], z_txt_tsne[i, 1]),
+                coordsA="data",
+                coordsB="data",
+                axesA=ax1,
+                axesB=ax2,
+                color=line_color,
+                alpha=0.4,
+                linestyle="--",
+                linewidth=0.8
+            )
+            fig.add_artist(con)
+
+    elif dataset_id=='Flickr30k':
+        for i in range(num_lines):
+            con = ConnectionPatch(
+                xyA=(z_img_tsne[i, 0], z_img_tsne[i, 1]),
+                xyB=(z_txt_tsne[i, 0], z_txt_tsne[i, 1]),
+                coordsA="data",
+                coordsB="data",
+                axesA=ax1,
+                axesB=ax2,
+                alpha=0.4,
+                linestyle="--",
+                linewidth=0.8
+            )
+            fig.add_artist(con)
 
     plt.suptitle('Cross-Modal Latent Space Alignment', fontsize=18, y=1.02)
 
@@ -791,7 +881,7 @@ def evaluate_train_val(model, device, train_subset, val_subset):
     val_scores = evaluate_consistency(model, val_subset, device)
     print("Validation Set Consistency Accuracy:", val_scores['accuracy'])
     
-def evaluate_main(kl_coef, latent_dim=256, model_checkpoint='checkpoints/final_model_256.pt'):
+def evaluate_main(kl_coef,lr_coef, dataset, latent_dim=256, model_checkpoint='checkpoints/final_model_256.pt'):
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     random.seed(config['seed'])
@@ -799,33 +889,43 @@ def evaluate_main(kl_coef, latent_dim=256, model_checkpoint='checkpoints/final_m
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device for evaluation: {device}")
 
+    clip_tokenizer = Tokenizer(config['max_length'],
+                               # AutoTokenizer.from_pretrained("distilbert-base-multilingual-cased"))
+                               AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32"))
+
     # Load model and dataset using the provided latent_dim and model_checkpoint
-    model, full_dataset = load_model_and_data(device, latent_dim, model_checkpoint=model_checkpoint)
+    model, full_dataset = load_model_and_data(device, dataset, clip_tokenizer, latent_dim, model_checkpoint=model_checkpoint)
 
     dataset_size = len(full_dataset)
     val_size = int(config['val_split'] * dataset_size)
     train_size = dataset_size - val_size
 
-    train_subset, val_subset = torch.utils.data.random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(config['seed'])
-    )
+    if dataset=='Flickr30k':
+        train_subset=full_dataset[0]
+        val_subset=full_dataset[1]
+    elif dataset=='CelebAMask-HQ':
+        train_subset, val_subset = torch.utils.data.random_split(
+            full_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(config['seed'])
+        )
 
-    evaluate_train_val(model, device, train_subset, val_subset)
+
+
+    #evaluate_train_val(model, device, train_subset, val_subset)
     
     # confusion matrix for consistency pairs
-    metrics = visualize_consistency_pairs(model, val_subset, device, num_samples=3, save_dir='eval_results/'+str(kl_coef))
-    visualize_consistency_confusion_matrix(metrics, save_dir='eval_results/'+str(kl_coef))
-    scores = evaluate_consistency(model, val_subset, device)
-    print(f"Consistency Classification Accuracy: {scores['accuracy']:.3f}")
-    print(f"Threshold used: {scores['threshold']}")
-    print(f"Correct classifications: {scores['correct']}/{scores['total']}")
+    # metrics = visualize_consistency_pairs(model, val_subset, device, num_samples=3, save_dir='eval_results/'+str(kl_coef))
+    # visualize_consistency_confusion_matrix(metrics, save_dir='eval_results/'+str(kl_coef))
+    # scores = evaluate_consistency(model, val_subset, device)
+    # print(f"Consistency Classification Accuracy: {scores['accuracy']:.3f}")
+    # print(f"Threshold used: {scores['threshold']}")
+    # print(f"Correct classifications: {scores['correct']}/{scores['total']}")
     
     # Visualize pairs with scores
     #visualize_consistency_pairs(model, val_subset, device)
     
-    visualize_paired_latent_spaces_2d(model, val_subset, device, num_samples=500, save_dir='eval_results/'+str(kl_coef))
+    visualize_paired_latent_spaces_2d(model, val_subset, device, dataset, clip_tokenizer, num_samples=500, save_dir='eval_results/'+str(kl_coef)+'_'+str(lr_coef))
         
     # Visualize 5 samples of image-to-text generation
     #visualize_image_to_text_generation(model, val_subset, device, num_samples=10, save_dir='eval_results')
@@ -838,8 +938,13 @@ def evaluate_main(kl_coef, latent_dim=256, model_checkpoint='checkpoints/final_m
 if __name__ == "__main__":
 
     kl_coef='kl_coef_1'
+    lr_coef='lr_0.0001'
+    dataset='Flickr30k'
+    #dataset='CelebAMask-HQ'
 
     # consistency checking scores
     #evaluate_main(latent_dim=128, model_checkpoint='checkpoints/final_model_128.pt')
-    evaluate_main(kl_coef, latent_dim=256, model_checkpoint='checkpoints/final_model_'+str(kl_coef)+'.pt')
+    #evaluate_main(kl_coef, lr_coef, dataset, latent_dim=256, model_checkpoint='checkpoints/final_model_'+str(kl_coef)+'.pt')
+
+    evaluate_main(kl_coef, lr_coef, dataset, latent_dim=256, model_checkpoint='checkpoints/final_model_'+str(kl_coef)+'_'+str(lr_coef)+'.pt')
     #evaluate_main(latent_dim=512, model_checkpoint='checkpoints/final_model_512.pt')

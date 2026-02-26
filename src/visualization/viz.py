@@ -5,6 +5,11 @@ import torch
 import re
 from ..data.utils import clean_and_validate_attributes, generate_natural_description
 
+import torch.nn.functional as F
+
+
+
+
 class VisualizationUtils:
     def __init__(self, save_dir='results'):
         self.save_dir = save_dir
@@ -197,48 +202,82 @@ class VisualizationUtils:
         plt.savefig(os.path.join(self.save_dir,f'comparisons_epoch_{epoch}.png'))
         plt.close()
 
-def visualize_results(kl_coef, model, test_dataset, epoch, phase_name, num_samples=5, device='cuda'):
-    viz = VisualizationUtils(save_dir=f'results/{phase_name}_kl_coef_{kl_coef}')
+def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoch, phase_name, num_samples=5, device='cuda'):
+    viz = VisualizationUtils(save_dir=f'results/{phase_name}_kl_coef_{kl_coef}_lr_{lr}')
     samples = [test_dataset[i] for i in range(min(num_samples,len(test_dataset)))]
     images = torch.stack([s['image'] for s in samples]).to(device)
     texts = [s['caption'] for s in samples]
 
+    if dataset=='Flickr30k':
+        input_tokens = tokenizer(texts).to(device)
+        target_attributes = input_tokens['input_ids']
+        attention_mask = input_tokens['attention_mask']
+        text_attrs=[target_attributes, attention_mask]
+
     with torch.no_grad():
-        generated_texts = model.generate_from_image(images)
+        generated_texts = model.generate_from_image(images, dataset, tokenizer)
         if isinstance(generated_texts,str):
             generated_texts = [generated_texts]*len(images)
         elif not isinstance(generated_texts,list):
             generated_texts = generated_texts.split(" ")
 
-        cleaned_generated_texts = []
-        for text in generated_texts:
-            cleaned_words = [word for word in text.split() if word.isalnum()]
-            cleaned_text = generate_natural_description(cleaned_words)
-            cleaned_generated_texts.append(cleaned_text)
+        if dataset=='CelebAMask-HQ':
+            cleaned_generated_texts = []
+            for text in generated_texts:
+                cleaned_words = [word for word in text.split() if word.isalnum()]
+                cleaned_text = generate_natural_description(cleaned_words)
+                cleaned_generated_texts.append(cleaned_text)
 
-        generated_texts = cleaned_generated_texts
-        generated_images = []
-        for text in texts:
-            extracted_attrs = clean_and_validate_attributes(text.split())
-            text_attrs = torch.zeros(model.num_attributes)
-            for attr in extracted_attrs:
-                attr_key = attr.lower().replace(' ','_')
-                for k,v in model.idx_to_attribute.items():
-                    if v == attr_key:
-                        text_attrs[k]=1.0
-            text_attrs = text_attrs.unsqueeze(0).to(device)
-            generated_image = model.generate_from_text(text_attrs)
-            generated_images.append(generated_image[0])
-        generated_images = torch.stack(generated_images)
+            generated_texts = cleaned_generated_texts
+
+        if dataset == 'CelebAMask-HQ':
+            generated_images = []
+            for text in texts:
+                extracted_attrs = clean_and_validate_attributes(text.split())
+                text_attrs = torch.zeros(model.num_attributes)
+                for attr in extracted_attrs:
+                    attr_key = attr.lower().replace(' ','_')
+                    for k,v in model.idx_to_attribute.items():
+                        if v == attr_key:
+                            text_attrs[k]=1.0
+                text_attrs = text_attrs.unsqueeze(0).to(device)
+                attention_mask=torch.ones(1)
+                text_attrs_v=[text_attrs,attention_mask]
+                generated_image = model.generate_from_text(text_attrs_v)
+                generated_images.append(generated_image[0])
+            generated_images = torch.stack(generated_images)
+
+
+        elif dataset=='Flickr30k':
+            generated_images = model.generate_from_text(text_attrs)
+
 
         reconstructed_images = model.decode_image(model.encode_image(images)[0])
 
-        attributes = torch.stack([s['attributes'] for s in samples]).to(device)
-        z_text, _, _ = model.encode_text(attributes)
+        if dataset == 'CelebAMask-HQ':
+            attributes = torch.stack([s['attributes'] for s in samples]).to(device)
+            z_text, _, _ = model.encode_text(attributes,attention_mask)
+        elif dataset=='Flickr30k':
+            z_text, _, _ = model.encode_text(target_attributes,attention_mask)
+
+
         attr_probs, pred_attributes = model.text_decoder(z_text)
-        recon_texts = model._attributes_to_text(pred_attributes)
-        if isinstance(recon_texts,str):
-            recon_texts = [recon_texts]
+
+        if dataset == 'Flickr30k':
+            # embedding_weights = F.normalize(model.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)
+            # logits = torch.matmul(F.normalize(attr_probs, dim=-1), embedding_weights.T)  # (batch, seq_len, vocab_size)
+            pred_ids = torch.argmax(attr_probs, dim=-1)
+
+            pred_ids_list = pred_ids.detach().cpu().tolist()
+
+            recon_texts = [
+                tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in pred_ids_list
+            ]
+        elif dataset=='CelebAMask-HQ':
+            recon_texts = model._attributes_to_text(pred_attributes)
+            if isinstance(recon_texts,str):
+                recon_texts = [recon_texts]
 
     viz.save_face_grid(images.detach().cpu(), texts, epoch, f'original_faces_epoch_{epoch}.png')
     viz.save_face_grid(generated_images.detach().cpu(), texts, epoch, f'txt2img_epoch_{epoch}.png')
@@ -248,23 +287,24 @@ def visualize_results(kl_coef, model, test_dataset, epoch, phase_name, num_sampl
     viz.save_img2text_results(images.detach().cpu(), generated_texts, texts, epoch)
     viz.save_text_recon_results(input_texts=texts, recon_texts=recon_texts, epoch=epoch)
 
-    if epoch % 10 == 0:
-        base_image = images[0]
-        attributes_to_add = ['young','smiling','glasses','blond hair']
-        manipulated_images=[]
-        for attr in attributes_to_add:
-            extracted_attrs = clean_and_validate_attributes([attr])
-            text_attrs = torch.zeros((1,model.num_attributes),device=device)
-            for extracted_attr in extracted_attrs:
-                attr_key = extracted_attr.lower().replace(' ','_')
-                for idx,attribute_name in model.idx_to_attribute.items():
-                    if attr_key == attribute_name:
-                        text_attrs[0,idx] = 1.0
-            with torch.no_grad():
-                manipulated_image = model.generate_from_text(text_attrs)
-            manipulated_images.append(manipulated_image[0].detach().cpu())
+    if dataset == 'CelebAMask-HQ':
+        if epoch % 10 == 0:
+            base_image = images[0]
+            attributes_to_add = ['young','smiling','glasses','blond hair']
+            manipulated_images=[]
+            for attr in attributes_to_add:
+                extracted_attrs = clean_and_validate_attributes([attr])
+                text_attrs = torch.zeros((1,model.num_attributes),device=device)
+                for extracted_attr in extracted_attrs:
+                    attr_key = extracted_attr.lower().replace(' ','_')
+                    for idx,attribute_name in model.idx_to_attribute.items():
+                        if attr_key == attribute_name:
+                            text_attrs[0,idx] = 1.0
+                with torch.no_grad():
+                    manipulated_image = model.generate_from_text(text_attrs)
+                manipulated_images.append(manipulated_image[0].detach().cpu())
 
-        viz.save_attribute_manipulation(base_image.detach().cpu(), manipulated_images, attributes_to_add, epoch)
+            viz.save_attribute_manipulation(base_image.detach().cpu(), manipulated_images, attributes_to_add, epoch)
 
     print(f"Results saved in {viz.save_dir}")
     return viz.save_dir

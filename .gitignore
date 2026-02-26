@@ -5,6 +5,7 @@ training/
 checkpoints/
 eval_results/
 huggingface_data/
+results_celeba/
 
 # Ignore the CelebAMask-HQ zip file
 CelebAMask-HQ.zip

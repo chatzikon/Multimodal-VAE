@@ -9,8 +9,8 @@ class Flickr30kDataset(Dataset):
 
         self.transform = transforms.Compose(
             [
-                #transforms.Resize((224, 224)),
-                transforms.Resize((64, 64)),
+                transforms.Resize((224, 224)),
+                #transforms.Resize((64, 64)),
                 transforms.ToTensor(),
             ]
         )
