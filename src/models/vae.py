@@ -3,6 +3,7 @@ from pyexpat import features
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+#from numpy.setup import configuration
 from torchvision.models import vgg16, VGG16_Weights
 
 from .components import ResidualBlock, ResidualLinear
@@ -11,11 +12,40 @@ from ..data.utils import clean_and_validate_attributes, generate_natural_descrip
 
 from transformers import AutoModel
 
-from transformers import CLIPTextConfig, CLIPTextModel
-from transformers import CLIPVisionConfig, CLIPVisionModel
+from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProjection
+from transformers import CLIPVisionConfig, CLIPVisionModel, CLIPVisionModelWithProjection
+
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn import TransformerDecoder, TransformerDecoderLayer
 
 import torchvision.models as models
+import math
 
+def shift_right(labels, pad_token_id):
+    shifted = labels.new_zeros(labels.shape)
+
+    shifted[:, 1:] = labels[:, :-1]
+    shifted[:, 0] = pad_token_id
+
+    return shifted
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=50, dropout=0.1):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 
 
@@ -47,13 +77,23 @@ class ImageEncoder(nn.Module):
 
         elif dataset == 'Flickr30k':
 
-            configuration = CLIPVisionConfig()
-            self.base = CLIPVisionModel(configuration).from_pretrained("openai/clip-vit-base-patch32")
-            #base = models.resnet34(pretrained=True)
+            #configuration = CLIPVisionConfig()
+            #self.base = CLIPVisionModel(configuration).from_pretrained("openai/clip-vit-base-patch32")
+            self.base = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+            #self.encoder = models.resnet34(pretrained=True)
+            self.encoder=nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 2 * latent_dim)
+        )
             #d_in = base.fc.in_features
             #base.fc = nn.Identity()
             #self.base = base
-            self.projection = Projection(768, 2 * latent_dim)
+            #self.projection = Projection(768, 2 * latent_dim)
             for p in self.base.parameters():
                 p.requires_grad = False
 
@@ -70,11 +110,14 @@ class ImageEncoder(nn.Module):
         if self.dataset == 'CelebAMask-HQ':
             features = self.encoder(x)
         elif self.dataset == 'Flickr30k':
-            projected_vec = self.projection(self.base(x).pooler_output)
-            projection_len = torch.norm(projected_vec, dim=-1, keepdim=True)
-            features=projected_vec / projection_len
+            x=self.base(x)
+            clip_output=x.last_hidden_state
+            features=self.encoder(x.image_embeds)
+            # projected_vec = self.projection(x.pooler_output)
+            # projection_len = torch.norm(projected_vec, dim=-1, keepdim=True)
+            # features=projected_vec / projection_len
 
-        return self.fc_mu(features), self.fc_var(features)
+        return self.fc_mu(features), self.fc_var(features), clip_output[:,:-1,:]
 
 
 class Projection(nn.Module):
@@ -92,7 +135,7 @@ class Projection(nn.Module):
         return embeds
 
 class TextEncoder(nn.Module):
-    def __init__(self, latent_dim, num_attributes):
+    def __init__(self, vocab_size, latent_dim,e_dim, num_attributes, nheads, nlayers, pad_idx):
         super().__init__()
         hidden_dim = 512
 
@@ -105,38 +148,58 @@ class TextEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, latent_dim*2)
             )
-        elif num_attributes==32:
+        elif num_attributes==49:
             # self.base = AutoModel.from_pretrained("distilbert-base-multilingual-cased")
             # self.projection = Projection(768, 2*latent_dim)
-            configuration = CLIPTextConfig()
-            self.base = CLIPTextModel(configuration).from_pretrained("openai/clip-vit-base-patch32")
-            self.projection = Projection(512, 2 * latent_dim)
-            for p in self.base.parameters():
-                p.requires_grad = False
+            # configuration = CLIPTextConfig()
+            # self.base = CLIPTextModel(configuration).from_pretrained("openai/clip-vit-base-patch32")
+            # self.projection = Projection(512, 2 * latent_dim)
+            # for p in self.base.parameters():
+            #     p.requires_grad = False
+
+            #self.base = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+
+            self.e_dim = e_dim
+
+            self.embedding = nn.Embedding(vocab_size, e_dim, padding_idx=pad_idx)
+            self.pos_encoding = PositionalEncoding(e_dim)
+            encoder_layers = TransformerEncoderLayer(d_model=e_dim, nhead=nheads, dim_feedforward=4*latent_dim, dropout=0.2)
+            self.transformer_encoder = TransformerEncoder(encoder_layer=encoder_layers, num_layers=nlayers)
+            self.hid2latparams = nn.Linear(e_dim, 2 * latent_dim)
+            # for p in self.base.parameters():
+            #     p.requires_grad = False
 
 
         self.mu_head = nn.Linear(latent_dim*2, latent_dim)
         self.logvar_head = nn.Linear(latent_dim*2, latent_dim)
 
-    def forward(self, attributes, attention_mask):
+    def forward(self, attributes, pad_mask=None):
 
         if self.num_attributes==10:
             x = self.fc(attributes)
-        elif self.num_attributes==32:
+        elif self.num_attributes==49:
             #out = self.base(attributes, attention_mask=attention_mask)[1]
-            out = self.base(attributes, attention_mask=attention_mask)[0]
-            #out = out[:, 0, :]  # get CLS token output
-            projected_vec = self.projection(out)
-            projection_len = torch.norm(projected_vec, dim=-1, keepdim=True)
-            x=projected_vec/projection_len
-            x=x.mean(dim=1)
+            # out = self.base(attributes, attention_mask=attention_mask)[0]
+            # #out = out[:, 0, :]  # get CLS token output
+            # projected_vec = self.projection(out)
+            # projection_len = torch.norm(projected_vec, dim=-1, keepdim=True)
+            # x=projected_vec/projection_len
+            # x=x.mean(dim=1)
+
+
+
+            embedded = self.embedding(attributes) * math.sqrt(self.e_dim)
+            embedded = self.pos_encoding(embedded)
+            hidden = self.transformer_encoder(embedded, src_key_padding_mask=pad_mask)
+            #hidden = self.word2sen_hidden(hidden)
+            x = self.hid2latparams(hidden)
 
         mu = self.mu_head(x)
         logvar = self.logvar_head(x)
         return mu, logvar
 
 class TextDecoder(nn.Module):
-    def __init__(self, latent_dim, num_attributes, vocab_size, device):
+    def __init__(self, latent_dim, e_dim, num_attributes, vocab_size, device, nheads, nlayers, pad_idx):
         super().__init__()
         self.hidden_dim = 512
         self.num_attributes = num_attributes
@@ -152,7 +215,7 @@ class TextDecoder(nn.Module):
                 nn.Linear(self.hidden_dim, num_attributes),
                 nn.Sigmoid()
             )
-        elif num_attributes==32:
+        elif num_attributes==49:
         #     self.fc = nn.Sequential(
         #     nn.Linear(latent_dim, 2048),
         #     nn.LeakyReLU(0.2),
@@ -165,23 +228,33 @@ class TextDecoder(nn.Module):
             # self.attention = nn.MultiheadAttention(embed_dim=768, num_heads=8)
             # self.decoder_rnn = nn.GRU(self.hidden_dim + latent_dim, self.hidden_dim, batch_first=True)
             # self.output_fc=nn.Linear(self.hidden_dim, vocab_size)
-            self.pos_embedding = nn.Parameter(torch.randn(num_attributes, self.hidden_dim))
-            decoder_layer = nn.TransformerDecoderLayer(d_model=self.hidden_dim, nhead=self.nhead)
-            self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.num_layers)
-            self.output_fc = nn.Linear(self.hidden_dim, vocab_size)
+            # self.pos_embedding = nn.Parameter(torch.randn(num_attributes, self.hidden_dim))
+            # decoder_layer = nn.TransformerDecoderLayer(d_model=self.hidden_dim, nhead=self.nhead)
+            # self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.num_layers)
+            # self.output_fc = nn.Linear(self.hidden_dim, vocab_size)
+            #
+            # self.latent_proj = nn.Linear(self.hidden_dim//2, self.hidden_dim)
+            self.e_dim = e_dim
 
-            self.latent_proj = nn.Linear(self.hidden_dim//2, self.hidden_dim)
+            self.embedding = nn.Embedding(vocab_size, e_dim, padding_idx=pad_idx)
+            self.pos_encoding = PositionalEncoding(e_dim)
+            self.lat2hid = nn.Linear(latent_dim, e_dim)
+            decoder_layers = TransformerDecoderLayer(d_model=e_dim, nhead=nheads, dim_feedforward=4*latent_dim, dropout=0.2)
+            self.transformer_decoder = TransformerDecoder(decoder_layer=decoder_layers, num_layers=nlayers)
+            self.hid2logits = nn.Linear(e_dim, vocab_size)
+
+            self.img2input=nn.Linear(768, e_dim)
 
 
 
 
-    def forward(self, z, x=None, padding_mask=None, threshold=0.5):
+    def forward(self, z, sentences=None, tgt_mask=None, tgt_pad_mask=None, threshold=0.5):
 
         if self.num_attributes == 10:
             attribute_probs = self.fc(z)
-        elif self.num_attributes==32:
+        elif self.num_attributes==49:
             # #x = attribute_probs.view(-1,512,8,4)
-            batch_size = z.size(0)
+            #batch_size = z.size(0)
             # #x_flat = x.view(batch_size,512,-1).permute(2,0,1)
             # x_flat = x.view(batch_size, 768, -1).permute(2, 0, 1)
             # attn_out, _ = self.attention(x_flat,x_flat,x_flat)
@@ -189,30 +262,51 @@ class TextDecoder(nn.Module):
             # #attribute_probs = x_flat.permute(1, 2, 0).view(batch_size, 32, 512)
             # attribute_probs = x_flat.permute(1, 2, 0).view(batch_size, 32, 768)
 
-            if x is not None:
-                # Use CLIP's embedding layer for input tokens
-                x_embed = x  # [batch, seq_len, clip_hidden_dim]
-                # Create padding mask for variable-length sequences
+            # if x is not None:
+            #     # Use CLIP's embedding layer for input tokens
+            #     x_embed = x  # [batch, seq_len, clip_hidden_dim]
+            #     # Create padding mask for variable-length sequences
+            #
+            # else:
+            #     x_embed = torch.zeros(batch_size, self.num_attributes, self.hidden_dim).to(self.device)
+            #
+            #
+            # # Each position has a learnable vector to give the model token order information
+            # x_embed = x_embed + self.pos_embedding.unsqueeze(0)  # [B, T, hidden_dim]
+            #
+            # # Repeat latent z for every time step
+            # z_repeat = z.unsqueeze(1).repeat(1, self.num_attributes, 1)
+            # z_repeat = self.latent_proj(z_repeat)
+            # decoder_input = x_embed + z_repeat
+            # #decoder_input = torch.cat([x_embed, z_repeat], dim=-1)
+            # #out, _ = self.decoder_rnn(decoder_input)
+            # out = self.transformer_decoder(
+            #     decoder_input.transpose(0, 1),  # [T, B, hidden_dim]
+            #     decoder_input.transpose(0, 1),  # memory same as input for non-autoregressive
+            #     tgt_key_padding_mask=padding_mask  # True=ignore
+            # )
+            # attribute_probs = self.output_fc(out)
+
+            batch_size = z.size(0)
+            if z is not None:
+                memories = self.lat2hid(z)
+                if memories.ndim==2:
+                    memories = memories.unsqueeze(0)
 
             else:
-                x_embed = torch.zeros(batch_size, self.num_attributes, self.hidden_dim).to(self.device)
+                memories = torch.zeros(self.num_attributes, batch_size, self.hidden_dim).to(self.device)
+
+            if sentences.dtype==torch.int64:
+                embedded_targets = self.embedding(sentences) * math.sqrt(self.e_dim)
+                embedded_targets = self.pos_encoding(embedded_targets)
+            else:
+                embedded_targets = self.img2input(sentences)
+                embedded_targets=embedded_targets.transpose(0,1)
 
 
-            # Each position has a learnable vector to give the model token order information
-            x_embed = x_embed + self.pos_embedding.unsqueeze(0)  # [B, T, hidden_dim]
-
-            # Repeat latent z for every time step
-            z_repeat = z.unsqueeze(1).repeat(1, self.num_attributes, 1)
-            z_repeat = self.latent_proj(z_repeat)
-            decoder_input = x_embed + z_repeat
-            #decoder_input = torch.cat([x_embed, z_repeat], dim=-1)
-            #out, _ = self.decoder_rnn(decoder_input)
-            out = self.transformer_decoder(
-                decoder_input.transpose(0, 1),  # [T, B, hidden_dim]
-                decoder_input.transpose(0, 1),  # memory same as input for non-autoregressive
-                tgt_key_padding_mask=padding_mask  # True=ignore
-            )
-            attribute_probs = self.output_fc(out)
+            hidden = self.transformer_decoder(embedded_targets, memories, tgt_mask=tgt_mask,
+                                              tgt_key_padding_mask=tgt_pad_mask)
+            attribute_probs = self.hid2logits(hidden)
 
         predicted_attributes = (attribute_probs > threshold).float()
         return attribute_probs, predicted_attributes
@@ -311,7 +405,7 @@ class ImageDecoder(nn.Module):
         return self.decoder(x)
 
 class MultimodalVAE(nn.Module):
-    def __init__(self, device,tokenizer, dataset, latent_dim=512, num_attributes=10,  temperature=1.0):
+    def __init__(self, device,tokenizer, vocab_size, dataset, latent_dim=512, e_dim=32, nheads=8, nlayers=4, pad_token_id=0, num_attributes=10,  temperature=1.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_attributes = num_attributes
@@ -323,9 +417,9 @@ class MultimodalVAE(nn.Module):
         self.tokenizer = tokenizer
 
         self.image_encoder = ImageEncoder(latent_dim,dataset)
-        self.text_encoder = TextEncoder(latent_dim, num_attributes)
+        self.text_encoder = TextEncoder(vocab_size, latent_dim, e_dim, num_attributes, nheads, nlayers, pad_token_id)
         self.image_decoder = ImageDecoder(latent_dim, dataset)
-        self.text_decoder = TextDecoder(latent_dim, num_attributes, self.vocab_size, self.device)
+        self.text_decoder = TextDecoder(latent_dim, e_dim, num_attributes, self.vocab_size, self.device, nheads, nlayers, pad_token_id)
 
         self.norm_layer = nn.LayerNorm(latent_dim)
 
@@ -374,12 +468,12 @@ class MultimodalVAE(nn.Module):
         return mu
 
     def encode_image(self, images):
-        mu, log_var = self.image_encoder(images)
+        mu, log_var, clip_output = self.image_encoder(images)
         z = self.reparameterize(mu, log_var)
-        return z, mu, log_var
+        return z, mu, log_var, clip_output
 
-    def encode_text(self, attributes,attention_mask):
-        mu, log_var = self.text_encoder(attributes, attention_mask)
+    def encode_text(self, attributes, pad_mask=None):
+        mu, log_var = self.text_encoder(attributes,  pad_mask)
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var
 
@@ -393,25 +487,33 @@ class MultimodalVAE(nn.Module):
     #     descriptions = self._attributes_to_text(pred_attributes)
     #     return attr_probs, pred_attributes, descriptions
 
-    def forward(self, train_phase, images=None, target_attributes=None, attention_mask=None):
+    def forward(self, train_phase, images=None, target_attributes=None, pad_mask=None, tgt_mask=None, pad_id=0):
         outputs = {}
 
 
-        target_attributes_emb = self.text_encoder.base.text_model.embeddings.token_embedding(target_attributes)
-        outputs['embedded_tokens'] = target_attributes_emb
+        # target_attributes_emb = self.text_encoder.base.text_model.embeddings.token_embedding(target_attributes)
+        # outputs['embedded_tokens'] = target_attributes_emb
+        target_attributes_s = shift_right(
+            target_attributes,
+            pad_token_id=pad_id
+        )
 
         if images is not None:
-            z_image, image_mu, image_log_var = self.encode_image(images)
+            z_image, image_mu, image_log_var, clip_output = self.encode_image(images)
             outputs['image_mu'] = image_mu
             outputs['image_log_var'] = image_log_var
             outputs['z_image'] = z_image
             outputs['recon_images'] = self.decode_image(z_image)
 
-            if train_phase == True:
-                padding_mask = (target_attributes == self.tokenizer.tokenizer.pad_token_id)  # [B, T]
-                attr_probs_img, pred_attrs_img = self.text_decoder(z_image, target_attributes_emb, padding_mask)
-            else:
-                attr_probs_img, pred_attrs_img = self.text_decoder(z_image)
+
+
+            attr_probs_img, pred_attrs_img = self.text_decoder(z_image, clip_output)
+            # if train_phase == True:
+            #     #padding_mask = (target_attributes == self.tokenizer.tokenizer.pad_token_id)  # [B, T]
+            #     attr_probs_img, pred_attrs_img = self.text_decoder(z_image,  target_attributes_s, tgt_mask, pad_mask)
+            # else:
+            #     attr_probs_img, pred_attrs_img = self.text_decoder(z_image, target_attributes_s, tgt_mask, pad_mask)
+
 
 
             outputs['text_from_image_probs'] = attr_probs_img
@@ -424,32 +526,37 @@ class MultimodalVAE(nn.Module):
 
 
 
-                z_text, text_mu, text_log_var = self.encode_text(target_attributes, attention_mask)
+                z_text, text_mu, text_log_var = self.encode_text(target_attributes, pad_mask)
 
                 outputs['text_mu'] = text_mu
                 outputs['text_log_var'] = text_log_var
 
 
             elif self.dataset=='CelebAMask-HQ':
-                z_text, text_mu, text_log_var = self.encode_text(target_attributes, attention_mask)
+                z_text, text_mu, text_log_var = self.encode_text(target_attributes,  pad_mask)
 
                 outputs['text_mu'] = text_mu
                 outputs['text_log_var'] = text_log_var
 
 
-            outputs['z_text'] = z_text
+            outputs['z_text'] = z_text.transpose(0,1)
 
-            if train_phase == True:
-                padding_mask = (target_attributes == self.tokenizer.tokenizer.pad_token_id)  # [B, T]
-                attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes_emb,padding_mask)
-            else:
-                attr_probs, pred_attributes = self.text_decoder(z_text)
+            attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes_s, tgt_mask, pad_mask)
+            # if train_phase == True:
+            #     #padding_mask = (target_attributes == self.tokenizer.tokenizer.pad_token_id)  # [B, T]
+            #     attr_probs, pred_attributes = self.text_decoder(z_text,  target_attributes_s, tgt_mask, pad_mask)
+            # else:
+            #     attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes_s, tgt_mask, pad_mask)
+
+
 
             outputs['recon_text_probs'] = attr_probs
             #outputs['recon_text_attributes'] = pred_attributes
             #outputs['recon_text'] = self._attributes_to_text(pred_attributes)
 
-            image_from_text = self.decode_image(z_text)
+            z_t2i=z_text.mean(dim=0).squeeze(0)
+
+            image_from_text = self.decode_image(z_t2i)
 
 
             outputs['image_from_text'] = image_from_text
@@ -477,9 +584,10 @@ class MultimodalVAE(nn.Module):
     def generate_from_text(self, attributes):
         device = next(self.parameters()).device
         attributes_t = attributes[0].to(device)
-        attention_mask = attributes[1].to(device)
-        z_text, _, _ = self.encode_text(attributes_t, attention_mask)
-        return self.decode_image(z_text)
+        attributes_t = attributes_t.transpose(0, 1)
+        z_text, _, _ = self.encode_text(attributes_t)
+        z_t2i = z_text.mean(dim=0).squeeze(0)
+        return self.decode_image(z_t2i)
 
     @torch.no_grad()
     def generate_from_image(self, image, dataset, tokenizer):
@@ -487,11 +595,11 @@ class MultimodalVAE(nn.Module):
         image = image.to(device)
         if image.dim() == 3:
             image = image.unsqueeze(0)
-        z_image, _, _ = self.encode_image(image)
-        attribute_probs, pred_attributes = self.text_decoder(z_image)
+        z_image, _, _, clip_output = self.encode_image(image)
+        attribute_probs, pred_attributes = self.text_decoder(z_image, clip_output)
 
         if dataset == 'Flickr30k':
-            embedding_weights = F.normalize(self.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)
+            #embedding_weights = F.normalize(self.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)
             #embedding_weights = F.normalize(self.model.text_encoder.base.embeddings.word_embeddings.weight, dim=0)
             #logits = torch.matmul(F.normalize(attribute_probs, dim=-1), embedding_weights.T)  # (batch, seq_len, vocab_size)
             pred_ids = torch.argmax(attribute_probs, dim=-1)

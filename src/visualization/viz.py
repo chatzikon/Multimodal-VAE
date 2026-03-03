@@ -7,7 +7,31 @@ from ..data.utils import clean_and_validate_attributes, generate_natural_descrip
 
 import torch.nn.functional as F
 
+def create_masks(batch, pad_token):
+    """
+    Create padding and square subsequent masks
+    S - max sequence length
+    B - batch size
+    :param batch: batch of sentences to calculate masks for tensor(S,B)
+    :param pad_token: value of pad_token in the vocabulary definition
+    :return: pad_mask: padding mask, tensor(S,B)
+             mask: square subsequent mask, tensor(S,S)
+    """
+    pad_mask = (batch == pad_token).transpose(0, 1)
 
+    seq_len = batch.shape[0]
+    mask = (torch.triu(torch.ones((seq_len, seq_len), device=batch.device)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
+    return pad_mask, mask
+
+def shift_right(labels, pad_token_id):
+    shifted = labels.new_zeros(labels.shape)
+
+    shifted[:, 1:] = labels[:, :-1]
+    shifted[:, 0] = pad_token_id
+
+    return shifted
 
 
 class VisualizationUtils:
@@ -258,10 +282,15 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
             attributes = torch.stack([s['attributes'] for s in samples]).to(device)
             z_text, _, _ = model.encode_text(attributes,attention_mask)
         elif dataset=='Flickr30k':
-            z_text, _, _ = model.encode_text(target_attributes,attention_mask)
+            z_text, _, _ = model.encode_text(target_attributes)
 
+        pad_id = tokenizer.tokenizer.pad_token_id
+        target_attributes_s = shift_right(
+            target_attributes,
+            pad_token_id=pad_id
+        )
 
-        attr_probs, pred_attributes = model.text_decoder(z_text)
+        attr_probs, pred_attributes = model.text_decoder(z_text, target_attributes_s)
 
         if dataset == 'Flickr30k':
             # embedding_weights = F.normalize(model.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)

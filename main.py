@@ -20,6 +20,8 @@ import warnings
 
 import gc
 
+
+
 class Tokenizer:
     def __init__(self, max_length, tokenizer) -> None:
         self.tokenizer = tokenizer
@@ -69,11 +71,21 @@ def main(kl_coef, lr_G,lr_D):
 
         clip_tokenizer = Tokenizer(config['max_length'],
                                    #AutoTokenizer.from_pretrained("distilbert-base-multilingual-cased"))
-                                   AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32"))
+                                   #AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32"))
+                                   AutoTokenizer.from_pretrained("t5-small"))
 
-        #vocab_size = clip_tokenizer.tokenizer.vocab_size
+        ids1 = clip_tokenizer.tokenizer("a dog runs")["input_ids"]
+        ids2 = clip_tokenizer.tokenizer("a dog runs", add_special_tokens=False)["input_ids"]
 
-        model = MultimodalVAE(device, clip_tokenizer, dataset=config['dataset'],  latent_dim=config['latent_dim'], num_attributes=config['max_length'],
+
+
+        pad_idx=clip_tokenizer.tokenizer.pad_token_id
+
+        vocab_size = clip_tokenizer.tokenizer.vocab_size
+
+        model = MultimodalVAE(device, clip_tokenizer, vocab_size, dataset=config['dataset'],  latent_dim=config['latent_dim'],
+                              e_dim=config['embedding_dim'],  nheads=config['nheads'],
+                              nlayers=config['nlayers'], pad_token_id=pad_idx, num_attributes=config['max_length'],
                                 temperature=1.0).to(device)
 
 
@@ -247,7 +259,8 @@ if __name__ == "__main__":
 
     kl_coef=[1,10,50,1e-1]
     #kl_coef = [10]
-    lr=[1e-5,1e-6]
+    lr=[1e-5, 1e-6, 1e-7]
+    #lr=[1e-4]
 
     for j in range(len(kl_coef)):
         for i in range(len(lr)):

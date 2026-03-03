@@ -6,6 +6,7 @@ checkpoints/
 eval_results/
 huggingface_data/
 results_celeba/
+__pycache__
 
 # Ignore the CelebAMask-HQ zip file
 CelebAMask-HQ.zip

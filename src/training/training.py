@@ -23,6 +23,24 @@ from .losses import (
 )
 from ..visualization.viz import visualize_results
 
+def create_masks(batch, pad_token):
+    """
+    Create padding and square subsequent masks
+    S - max sequence length
+    B - batch size
+    :param batch: batch of sentences to calculate masks for tensor(S,B)
+    :param pad_token: value of pad_token in the vocabulary definition
+    :return: pad_mask: padding mask, tensor(S,B)
+             mask: square subsequent mask, tensor(S,S)
+    """
+    pad_mask = (batch == pad_token).transpose(0, 1)
+
+    seq_len = batch.shape[0]
+    mask = (torch.triu(torch.ones((seq_len, seq_len), device=batch.device)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+
+    return pad_mask, mask
+
 def flatten_extend(matrix):
     flat_list = []
     for row in matrix:
@@ -101,15 +119,21 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
     images = batch['image'].to(device)
     if phase_config['dataset']=='CelebAMask-HQ':
         target_attributes = batch['attributes'].to(device) if 'attributes' in batch else None
-        attention_mask=0
+        pad_mask=0
+        tgt_mask=0
     elif phase_config['dataset']=='Flickr30k':
         text = batch["caption"]
         input_tokens = clip_tokenizer(text).to(device)
         target_attributes = input_tokens['input_ids']
         attention_mask = input_tokens['attention_mask']
+        target_attributes=target_attributes.transpose(0,1)
 
 
-    outputs = model(True, images=images, target_attributes=target_attributes, attention_mask=attention_mask)
+        pad_mask, tgt_mask = create_masks(target_attributes, pad_token=clip_tokenizer.tokenizer.pad_token_id)
+
+        pad_idx = clip_tokenizer.tokenizer.pad_token_id
+
+    outputs = model(True, images=images, target_attributes=target_attributes, pad_mask=pad_mask, tgt_mask=tgt_mask, pad_id=pad_idx)
 
     # if phase_config['dataset'] == 'Flickr30k':
     #     pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1).float()
@@ -182,12 +206,13 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
         elif phase_config['dataset']=='Flickr30k':
             text_attr_loss = F.cross_entropy(
                 outputs['recon_text_probs'].view(-1, outputs['recon_text_probs'].size(-1)),
-                target_attributes.view(-1)
+                target_attributes.flatten(), ignore_index=pad_idx
             )
+
 
             img2text_attr_loss = F.cross_entropy(
                 outputs['text_from_image_probs'].view(-1, outputs['text_from_image_probs'].size(-1)),
-                target_attributes.view(-1)
+                target_attributes.flatten(), ignore_index=pad_idx
             )
 
 
@@ -255,8 +280,9 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
 
     total_loss = sum(losses.values())
     total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
     optimizer_G.step()
+
 
     losses['total_loss'] = total_loss.item()
     return {k:(v.item() if isinstance(v,torch.Tensor) else v) for k,v in losses.items()}
@@ -280,6 +306,8 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
         'val_total_loss':0
     }
 
+    pad_idx = clip_tokenizer.tokenizer.pad_token_id
+
     num_batches=0
     caption_pred_list=[]
     caption_gt_list_tot=[]
@@ -298,8 +326,17 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
                 input_tokens = clip_tokenizer(text).to(device)
                 target_attributes = input_tokens['input_ids']
                 attention_mask = input_tokens['attention_mask']
+                target_attributes = target_attributes.transpose(0, 1)
 
-            outputs = model(False, images=images, target_attributes=target_attributes, attention_mask=attention_mask)
+                pad_mask, tgt_mask = create_masks(target_attributes, pad_token=clip_tokenizer.tokenizer.pad_token_id)
+
+                pad_idx = clip_tokenizer.tokenizer.pad_token_id
+
+
+
+
+            outputs = model(False, images=images, target_attributes=target_attributes, pad_mask=pad_mask,
+                                tgt_mask=tgt_mask, pad_id=pad_idx)
 
             if phase_config['dataset'] == 'Flickr30k':
 
@@ -341,7 +378,7 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
 
                 text_attr_loss = F.cross_entropy(
                     outputs['recon_text_probs'].view(-1, outputs['recon_text_probs'].size(-1)),
-                    target_attributes.view(-1)
+                    target_attributes.flatten(), ignore_index=pad_idx
                 )
 
 
@@ -363,7 +400,7 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
                 elif phase_config['dataset'] == 'Flickr30k':
                     img2text_attr_loss = F.cross_entropy(
                         outputs['text_from_image_probs'].view(-1, outputs['text_from_image_probs'].size(-1)),
-                        target_attributes.view(-1)
+                        target_attributes.flatten(),  ignore_index=pad_idx
                     )
 
 
@@ -501,8 +538,13 @@ def evaluate_model(model, discriminator, test_loader, device, epoch, phase_confi
                 input_tokens = clip_tokenizer(text).to(device)
                 target_attributes = input_tokens['input_ids']
 
+                pad_mask, tgt_mask = create_masks(target_attributes, pad_token=clip_tokenizer.tokenizer.pad_token_id)
 
-            outputs = model(False, images=images, target_attributes=target_attributes)
+                pad_idx = clip_tokenizer.tokenizer.pad_token_id
+
+            outputs = model(False, images=images, target_attributes=target_attributes, pad_mask=pad_mask,
+                            tgt_mask=tgt_mask, pad_id=pad_idx)
+
 
             if phase_config['dataset'] == 'CelebAMask-HQ':
                 pred_attributes = (outputs['text_from_image_probs']>0.5).float()
