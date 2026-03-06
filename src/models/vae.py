@@ -21,6 +21,19 @@ from torch.nn import TransformerDecoder, TransformerDecoderLayer
 import torchvision.models as models
 import math
 
+class Word2SentenceEmbedding(nn.Module):
+    def __init__(self, hdim):
+        super(Word2SentenceEmbedding, self).__init__()
+        self.dense = nn.Linear(hdim, hdim)
+        self.activation = nn.Tanh()
+
+    def forward(self, hidden_states):
+        # take the hidden state corresponding to <sos> token
+        first_token_tensor = hidden_states[0]
+        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.activation(pooled_output)
+        return pooled_output
+
 def shift_right(labels, pad_token_id):
     shifted = labels.new_zeros(labels.shape)
 
@@ -116,8 +129,9 @@ class ImageEncoder(nn.Module):
             # projected_vec = self.projection(x.pooler_output)
             # projection_len = torch.norm(projected_vec, dim=-1, keepdim=True)
             # features=projected_vec / projection_len
-
-        return self.fc_mu(features), self.fc_var(features), clip_output[:,:-1,:]
+        #mu, logvar = x.chunk(2, dim=1)
+        #return self.fc_mu(features), self.fc_var(features), clip_output[:,:-1,:]
+        return features.chunk(2,dim=1)[0], features.chunk(2,dim=1)[1], clip_output[:,:-1,:]
 
 
 class Projection(nn.Module):
@@ -165,6 +179,7 @@ class TextEncoder(nn.Module):
             self.pos_encoding = PositionalEncoding(e_dim)
             encoder_layers = TransformerEncoderLayer(d_model=e_dim, nhead=nheads, dim_feedforward=4*latent_dim, dropout=0.2)
             self.transformer_encoder = TransformerEncoder(encoder_layer=encoder_layers, num_layers=nlayers)
+            self.word2sen_hidden = Word2SentenceEmbedding(hdim=e_dim)
             self.hid2latparams = nn.Linear(e_dim, 2 * latent_dim)
             # for p in self.base.parameters():
             #     p.requires_grad = False
@@ -191,11 +206,12 @@ class TextEncoder(nn.Module):
             embedded = self.embedding(attributes) * math.sqrt(self.e_dim)
             embedded = self.pos_encoding(embedded)
             hidden = self.transformer_encoder(embedded, src_key_padding_mask=pad_mask)
-            #hidden = self.word2sen_hidden(hidden)
+            hidden = self.word2sen_hidden(hidden)
             x = self.hid2latparams(hidden)
 
-        mu = self.mu_head(x)
-        logvar = self.logvar_head(x)
+        # mu = self.mu_head(x)
+        # logvar = self.logvar_head(x)
+        mu, logvar = x.chunk(2, dim=1)
         return mu, logvar
 
 class TextDecoder(nn.Module):
@@ -287,14 +303,12 @@ class TextDecoder(nn.Module):
             # )
             # attribute_probs = self.output_fc(out)
 
-            batch_size = z.size(0)
             if z is not None:
                 memories = self.lat2hid(z)
                 if memories.ndim==2:
                     memories = memories.unsqueeze(0)
 
-            else:
-                memories = torch.zeros(self.num_attributes, batch_size, self.hidden_dim).to(self.device)
+
 
             if sentences.dtype==torch.int64:
                 embedded_targets = self.embedding(sentences) * math.sqrt(self.e_dim)
@@ -405,7 +419,7 @@ class ImageDecoder(nn.Module):
         return self.decoder(x)
 
 class MultimodalVAE(nn.Module):
-    def __init__(self, device,tokenizer, vocab_size, dataset, latent_dim=512, e_dim=32, nheads=8, nlayers=4, pad_token_id=0, num_attributes=10,  temperature=1.0):
+    def __init__(self, device,tokenizer, vocab_size, dataset, latent_dim=32, e_dim=512, nheads=8, nlayers=4, pad_token_id=0, num_attributes=10,  temperature=1.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_attributes = num_attributes
@@ -472,7 +486,7 @@ class MultimodalVAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var, clip_output
 
-    def encode_text(self, attributes, pad_mask=None):
+    def encode_text(self, attributes, pad_mask):
         mu, log_var = self.text_encoder(attributes,  pad_mask)
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var
@@ -493,10 +507,10 @@ class MultimodalVAE(nn.Module):
 
         # target_attributes_emb = self.text_encoder.base.text_model.embeddings.token_embedding(target_attributes)
         # outputs['embedded_tokens'] = target_attributes_emb
-        target_attributes_s = shift_right(
-            target_attributes,
-            pad_token_id=pad_id
-        )
+        # target_attributes_s = shift_right(
+        #     target_attributes,
+        #     pad_token_id=pad_id
+        # )
 
         if images is not None:
             z_image, image_mu, image_log_var, clip_output = self.encode_image(images)
@@ -541,7 +555,7 @@ class MultimodalVAE(nn.Module):
 
             outputs['z_text'] = z_text.transpose(0,1)
 
-            attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes_s, tgt_mask, pad_mask)
+            attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes, tgt_mask, pad_mask.type(torch.float))
             # if train_phase == True:
             #     #padding_mask = (target_attributes == self.tokenizer.tokenizer.pad_token_id)  # [B, T]
             #     attr_probs, pred_attributes = self.text_decoder(z_text,  target_attributes_s, tgt_mask, pad_mask)
@@ -554,9 +568,9 @@ class MultimodalVAE(nn.Module):
             #outputs['recon_text_attributes'] = pred_attributes
             #outputs['recon_text'] = self._attributes_to_text(pred_attributes)
 
-            z_t2i=z_text.mean(dim=0).squeeze(0)
+            #z_t2i=z_text.mean(dim=0).squeeze(0)
 
-            image_from_text = self.decode_image(z_t2i)
+            image_from_text = self.decode_image(z_text)
 
 
             outputs['image_from_text'] = image_from_text
@@ -581,13 +595,12 @@ class MultimodalVAE(nn.Module):
         return 1 / (1 + kl_match)
 
     # @torch.no_grad()
-    def generate_from_text(self, attributes):
+    def generate_from_text(self, attributes, pad_mask):
         device = next(self.parameters()).device
-        attributes_t = attributes[0].to(device)
-        attributes_t = attributes_t.transpose(0, 1)
-        z_text, _, _ = self.encode_text(attributes_t)
-        z_t2i = z_text.mean(dim=0).squeeze(0)
-        return self.decode_image(z_t2i)
+        attributes_t = attributes.to(device)
+        z_text, _, _ = self.encode_text(attributes_t, pad_mask)
+        #z_t2i = z_text.mean(dim=0).squeeze(0)
+        return self.decode_image(z_text)
 
     @torch.no_grad()
     def generate_from_image(self, image, dataset, tokenizer):

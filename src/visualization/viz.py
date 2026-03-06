@@ -123,6 +123,14 @@ class VisualizationUtils:
                 f.write(f"Input: {input_text}\n")
                 f.write(f"Reconstructed: {recon_text}\n\n")
 
+    def save_text_recon_results_alt(self, input_texts, recon_texts, epoch):
+        file_path = os.path.join(self.save_dir, f'txt2txt_alt_epoch_{epoch}.txt')
+        with open(file_path,'w',encoding='utf-8') as f:
+            for i,(input_text,recon_text) in enumerate(zip(input_texts,recon_texts)):
+                f.write(f"Sample {i+1}:\n")
+                f.write(f"Input: {input_text}\n")
+                f.write(f"Reconstructed: {recon_text}\n\n")
+
     def save_img2text_results(self, input_images, generated_texts, original_captions, epoch):
         fig, axes = plt.subplots(3,5,figsize=(20,12),gridspec_kw={'height_ratios':[3,1,1]})
         fig.suptitle(f'Image to Text Generation - Epoch {epoch}', y=1.05)
@@ -236,7 +244,8 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
         input_tokens = tokenizer(texts).to(device)
         target_attributes = input_tokens['input_ids']
         attention_mask = input_tokens['attention_mask']
-        text_attrs=[target_attributes, attention_mask]
+        text_attrs=target_attributes
+        text_attrs=text_attrs.transpose(0,1)
 
     with torch.no_grad():
         generated_texts = model.generate_from_image(images, dataset, tokenizer)
@@ -244,6 +253,11 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
             generated_texts = [generated_texts]*len(images)
         elif not isinstance(generated_texts,list):
             generated_texts = generated_texts.split(" ")
+
+        pad_id = tokenizer.tokenizer.pad_token_id
+        eos_idx = tokenizer.tokenizer.eos_token_id
+        sos_idx = tokenizer.tokenizer.bos_token_id
+
 
         if dataset=='CelebAMask-HQ':
             cleaned_generated_texts = []
@@ -273,7 +287,8 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
 
 
         elif dataset=='Flickr30k':
-            generated_images = model.generate_from_text(text_attrs)
+            pad_mask = (text_attrs == pad_id).transpose(0,1)
+            generated_images = model.generate_from_text(text_attrs, pad_mask)
 
 
         reconstructed_images = model.decode_image(model.encode_image(images)[0])
@@ -282,26 +297,61 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
             attributes = torch.stack([s['attributes'] for s in samples]).to(device)
             z_text, _, _ = model.encode_text(attributes,attention_mask)
         elif dataset=='Flickr30k':
-            z_text, _, _ = model.encode_text(target_attributes)
+            z_text, _, _ = model.encode_text(text_attrs, pad_mask)
 
-        pad_id = tokenizer.tokenizer.pad_token_id
-        target_attributes_s = shift_right(
-            target_attributes,
-            pad_token_id=pad_id
-        )
+        # target_attributes_s = shift_right(
+        #     target_attributes,
+        #     pad_token_id=pad_id
+        # )
+        #############
+        # first target is <sos>
+        sen = torch.ones(1, 5).fill_(sos_idx).type(torch.long).to(device)
+        for i in range(tokenizer.max_length - 1):
+            # create mask
+            mask = (torch.triu(torch.ones((len(sen), len(sen)), device=device)) == 1).transpose(0, 1)
+            mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+            # decode
+            #out = self.decoder(z, sen, tgt_mask=mask, tgt_pad_mask=None)
+            out, _ = model.text_decoder(z_text, sen, tgt_mask=mask, tgt_pad_mask=None)
 
-        attr_probs, pred_attributes = model.text_decoder(z_text, target_attributes_s)
+            next_word_prob = out[-1].squeeze()
+            next_word = torch.argmax(next_word_prob,  dim=-1)
+            #next_word = next_word.tolist()
+
+            # add decoded word to sentence
+            #sen = torch.cat([sen, torch.ones(1, 5).fill_(next_word).type(torch.long).to(device)], dim=0)
+            sen = torch.cat([sen, next_word.unsqueeze(0).to(device)], dim=0)
+            # if next_word == eos_idx:
+            #     break
+
+        ####alt#####
+        pad_mask, tgt_mask = create_masks(text_attrs, pad_token=tokenizer.tokenizer.pad_token_id)
+        attr_probs_alt, _ = model.text_decoder(z_text, text_attrs, tgt_mask=tgt_mask, tgt_pad_mask=pad_mask)
 
         if dataset == 'Flickr30k':
             # embedding_weights = F.normalize(model.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)
             # logits = torch.matmul(F.normalize(attr_probs, dim=-1), embedding_weights.T)  # (batch, seq_len, vocab_size)
-            pred_ids = torch.argmax(attr_probs, dim=-1)
 
-            pred_ids_list = pred_ids.detach().cpu().tolist()
+            pred_ids_list = sen.detach().cpu().tolist()
+
+            pred_ids_list = [list(col) for col in zip(*pred_ids_list)]
 
             recon_texts = [
-                tokenizer.decode(ids, skip_special_tokens=True)
+                tokenizer.decode(ids, skip_special_tokens=False)
                 for ids in pred_ids_list
+            ]
+
+
+            ####alt#####
+            pred_ids_alt = torch.argmax(attr_probs_alt, dim=-1)
+
+            pred_ids_list_alt = pred_ids_alt.detach().cpu().tolist()
+
+            pred_ids_list_alt=[list(col) for col in zip(*pred_ids_list_alt)]
+
+            recon_texts_alt = [
+                tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in pred_ids_list_alt
             ]
         elif dataset=='CelebAMask-HQ':
             recon_texts = model._attributes_to_text(pred_attributes)
@@ -315,6 +365,9 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
 
     viz.save_img2text_results(images.detach().cpu(), generated_texts, texts, epoch)
     viz.save_text_recon_results(input_texts=texts, recon_texts=recon_texts, epoch=epoch)
+    viz.save_text_recon_results_alt(input_texts=texts, recon_texts=recon_texts_alt, epoch=epoch)
+
+
 
     if dataset == 'CelebAMask-HQ':
         if epoch % 10 == 0:

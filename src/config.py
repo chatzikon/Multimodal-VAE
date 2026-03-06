@@ -1,7 +1,7 @@
 from torch.nn.functional import embedding
 
 config = {
-    'latent_dim': 128,
+    'latent_dim': 32,
     'embedding_dim':512,
     'nheads': 8,
     'nlayers':4,
@@ -27,12 +27,13 @@ config = {
     #'phase2_epochs': 8,
     #'phase3_epochs': 18,
     # 'phase1_epochs': 1,
-     'phase2_epochs': 1,
-    'phase3_epochs': 1,
+     'phase2_epochs': 0,
+    'phase3_epochs': 0,
     'resume_phase': None,
     'resume_epoch': None,
     #'dataset': 'CelebAMask-HQ',
     'dataset': 'Flickr30k',
+
 
     'phase_configs': {
         1: {

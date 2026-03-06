@@ -55,8 +55,40 @@ def evaluate_all_metrics(gts, res):
     bleu, bleu_ind = bleu_scorer.compute_score(gts, res)
     scores['BLEU'] = bleu  # list of 4 BLEU scores
 
+
+
+    print(gts)
+    print(res)
     # METEOR
-    meteor, meteor_ind = Meteor().compute_score(gts, res)
+    try:
+        meteor, meteor_ind = Meteor().compute_score(gts, res)
+    except ValueError as e:
+        import json
+        import datetime
+
+        # 1. Create a unique filename for the crash dump
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dump_file = f"meteor_crash_epoch_10_{timestamp}.json"
+
+        # 2. Save the state so you can debug later
+        with open(dump_file, "w") as f:
+            json.dump({"gts": gts, "res": res}, f)
+
+        print(f"\n[!] METEOR Error at Epoch 10: {e}")
+        print(f"[!] Data dumped to {dump_file}. Searching for empty strings...")
+
+        # 3. Quick internal check to tell you WHY it failed in the console
+        for img_id, captions in res.items():
+            if not captions or not captions[0].strip():
+                print(f"    -> Found empty prediction at ID: {img_id}")
+
+        # 4. Provide fallback values so the training script doesn't stop
+        meteor = 0.0
+        meteor_ind = [0.0] * len(gts)
+        print("[!] Continuing training with METEOR = 0.0 for this epoch.\n")
+
+
+
     scores['METEOR'] = meteor
 
     # ROUGE-L
@@ -205,14 +237,14 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
 
         elif phase_config['dataset']=='Flickr30k':
             text_attr_loss = F.cross_entropy(
-                outputs['recon_text_probs'].view(-1, outputs['recon_text_probs'].size(-1)),
-                target_attributes.flatten(), ignore_index=pad_idx
+                outputs['recon_text_probs'][:-1,:,:].view(-1, outputs['recon_text_probs'].size(-1)),
+                target_attributes[1:,:].flatten(), ignore_index=pad_idx
             )
 
 
             img2text_attr_loss = F.cross_entropy(
-                outputs['text_from_image_probs'].view(-1, outputs['text_from_image_probs'].size(-1)),
-                target_attributes.flatten(), ignore_index=pad_idx
+                outputs['text_from_image_probs'][:-1,:,:].view(-1, outputs['text_from_image_probs'].size(-1)),
+                target_attributes[1:,:].flatten(), ignore_index=pad_idx
             )
 
 
@@ -341,9 +373,11 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
             if phase_config['dataset'] == 'Flickr30k':
 
                 pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1)
-                pred_ids_text2img = torch.argmax(outputs['recon_text_probs'], dim=-1)
+                #pred_ids_text2img = torch.argmax(outputs['recon_text_probs'], dim=-1)
 
                 pred_ids_list = pred_ids.detach().cpu().tolist()
+
+                pred_ids_list=[list(col) for col in zip(*pred_ids_list)]
 
                 caption_pred = [
                     clip_tokenizer.decode(ids, skip_special_tokens=True)
@@ -377,8 +411,8 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
                 # print(outputs['recon_text_probs'].size())
 
                 text_attr_loss = F.cross_entropy(
-                    outputs['recon_text_probs'].view(-1, outputs['recon_text_probs'].size(-1)),
-                    target_attributes.flatten(), ignore_index=pad_idx
+                    outputs['recon_text_probs'][:-1,:,:].view(-1, outputs['recon_text_probs'].size(-1)),
+                    target_attributes[1:,:].flatten(), ignore_index=pad_idx
                 )
 
 
@@ -399,8 +433,8 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
 
                 elif phase_config['dataset'] == 'Flickr30k':
                     img2text_attr_loss = F.cross_entropy(
-                        outputs['text_from_image_probs'].view(-1, outputs['text_from_image_probs'].size(-1)),
-                        target_attributes.flatten(),  ignore_index=pad_idx
+                        outputs['text_from_image_probs'][:-1,:,:].view(-1, outputs['text_from_image_probs'].size(-1)),
+                        target_attributes[1:,:].flatten(),  ignore_index=pad_idx
                     )
 
 
@@ -537,6 +571,7 @@ def evaluate_model(model, discriminator, test_loader, device, epoch, phase_confi
                 text = batch["caption"]
                 input_tokens = clip_tokenizer(text).to(device)
                 target_attributes = input_tokens['input_ids']
+                target_attributes=target_attributes.transpose(0, 1)
 
                 pad_mask, tgt_mask = create_masks(target_attributes, pad_token=clip_tokenizer.tokenizer.pad_token_id)
 

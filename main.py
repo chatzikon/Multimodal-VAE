@@ -42,7 +42,7 @@ class Tokenizer:
 
 
 
-def main(kl_coef, lr_G,lr_D):
+def main(kl_coef, lr_G,lr_D, reconst_vis):
     torch.manual_seed(config['seed'])
     np.random.seed(config['seed'])
     random.seed(config['seed'])
@@ -51,6 +51,11 @@ def main(kl_coef, lr_G,lr_D):
     print(f"Using device: {device}")
 
     kl_coef_init=np.ones(3)
+
+    if reconst_vis==False:
+        reconst_coef_init=config['phase_configs'][1]['reconstruction_weight']
+        config['phase_configs'][1]['reconstruction_weight']=0
+
 
     for i in range(len(config['phase_configs'])):
 
@@ -72,7 +77,8 @@ def main(kl_coef, lr_G,lr_D):
         clip_tokenizer = Tokenizer(config['max_length'],
                                    #AutoTokenizer.from_pretrained("distilbert-base-multilingual-cased"))
                                    #AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32"))
-                                   AutoTokenizer.from_pretrained("t5-small"))
+                                   #AutoTokenizer.from_pretrained("t5-small"))
+                                   AutoTokenizer.from_pretrained("facebook/bart-base"))
 
         ids1 = clip_tokenizer.tokenizer("a dog runs")["input_ids"]
         ids2 = clip_tokenizer.tokenizer("a dog runs", add_special_tokens=False)["input_ids"]
@@ -91,11 +97,17 @@ def main(kl_coef, lr_G,lr_D):
 
     discriminator = PatchDiscriminator(in_channels=3, ndf=64).to(device)
 
-    optimizer_G = torch.optim.AdamW(
+    # optimizer_G = torch.optim.AdamW(
+    #     model.parameters(),
+    #     lr=config['learning_rate_G'],
+    #     betas=(0.5,0.999),
+    #     weight_decay=0.01
+    # )
+
+    optimizer_G = torch.optim.SGD(
         model.parameters(),
         lr=config['learning_rate_G'],
-        betas=(0.5,0.999),
-        weight_decay=0.01
+        momentum=0.9
     )
 
     optimizer_D = torch.optim.AdamW(
@@ -244,12 +256,12 @@ def main(kl_coef, lr_G,lr_D):
 
     for i in range(len(config['phase_configs'])):
         config['phase_configs'][i+1]['kl_weight']=kl_coef_init[i]
-        print(config['phase_configs'][i + 1]['kl_weight'])
 
-    from numba import cuda
+    if reconst_vis==False:
+       config['phase_configs'][1]['reconstruction_weight']= reconst_coef_init
 
-    cuda.select_device(0)  # choosing second GPU
-    cuda.close()
+    print(torch.cuda.memory_allocated())
+    print(torch.cuda.memory_reserved())
 
 
 
@@ -257,13 +269,18 @@ if __name__ == "__main__":
 
     #kl_coef=[1000,500,400,300,200,100,10,1,1e-1,1e-2,1e-3]
 
-    kl_coef=[1,10,50,1e-1]
-    #kl_coef = [10]
-    lr=[1e-5, 1e-6, 1e-7]
-    #lr=[1e-4]
+    # kl_coef=[1]
+    # lr=[0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
+    #
+    # for j in range(len(kl_coef)):
+    #     for i in range(len(lr)):
+    #         main(kl_coef[j], lr[i], lr[i]/10, False)
+
+    kl_coef = [1]
+    lr = [0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
 
     for j in range(len(kl_coef)):
         for i in range(len(lr)):
-            main(kl_coef[j], lr[i], lr[i]//10)
+            main(kl_coef[j], lr[i], lr[i] / 10, True)
 
 
