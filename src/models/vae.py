@@ -10,16 +10,20 @@ from .components import ResidualBlock, ResidualLinear
 from ..training.losses import identity_consistency_loss, compute_distribution_matching_loss
 from ..data.utils import clean_and_validate_attributes, generate_natural_description
 
-from transformers import AutoModel
 
-from transformers import CLIPTextConfig, CLIPTextModel, CLIPTextModelWithProjection
-from transformers import CLIPVisionConfig, CLIPVisionModel, CLIPVisionModelWithProjection
+from transformers import CLIPVisionModelWithProjection, CLIPTextModelWithProjection
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.nn import TransformerDecoder, TransformerDecoderLayer
 
 import torchvision.models as models
 import math
+
+class Identity(nn.Module):
+    def __init__(self):
+        super(Identity,self).__init__()
+    def forward(self,x):
+        return (x)
 
 class Word2SentenceEmbedding(nn.Module):
     def __init__(self, hdim):
@@ -63,10 +67,11 @@ class PositionalEncoding(nn.Module):
 
 
 class ImageEncoder(nn.Module):
-    def __init__(self, latent_dim, dataset):
+    def __init__(self, latent_dim, dataset, scheme):
         super().__init__()
 
         self.dataset = dataset
+        self.scheme=scheme
 
         if dataset == 'CelebAMask-HQ':
             self.encoder = nn.Sequential(
@@ -92,17 +97,26 @@ class ImageEncoder(nn.Module):
 
             #configuration = CLIPVisionConfig()
             #self.base = CLIPVisionModel(configuration).from_pretrained("openai/clip-vit-base-patch32")
-            self.base = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
-            #self.encoder = models.resnet34(pretrained=True)
-            self.encoder=nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 2 * latent_dim)
-        )
+
+            if scheme=='c' or scheme=='d':
+                self.base = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+                self.encoder = models.resnet18(pretrained=True)
+            elif scheme=='b':
+                self.base = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+                self.encoder = self.base
+            elif scheme == 'a':
+                self.encoder = models.resnet18(pretrained=True)
+                self.base=self.encoder
+
+
+            self.enc2lat = nn.Linear(512, 2 * latent_dim)
+
+            self.encoder.fc=Identity()
+           #  self.enc2lat=nn.Sequential(
+           #      nn.Linear(512, 256),
+           #      nn.ReLU(),
+           #      nn.Linear(128, 2 * latent_dim)
+           # )
             #d_in = base.fc.in_features
             #base.fc = nn.Identity()
             #self.base = base
@@ -110,8 +124,8 @@ class ImageEncoder(nn.Module):
             for p in self.base.parameters():
                 p.requires_grad = False
 
-            self.fc_mu = nn.Linear(2*latent_dim, latent_dim)
-            self.fc_var = nn.Linear(2*latent_dim, latent_dim)
+            # self.fc_mu = nn.Linear(2*latent_dim, latent_dim)
+            # self.fc_var = nn.Linear(2*latent_dim, latent_dim)
 
 
 
@@ -123,15 +137,32 @@ class ImageEncoder(nn.Module):
         if self.dataset == 'CelebAMask-HQ':
             features = self.encoder(x)
         elif self.dataset == 'Flickr30k':
-            x=self.base(x)
-            clip_output=x.last_hidden_state
-            features=self.encoder(x.image_embeds)
+
+            if self.scheme == 'a':
+                clip_output = self.base(x)
+            else:
+                clip_output=self.base(x).last_hidden_state
+
+
+
+            #clip_output=x.last_hidden_state
+            if self.scheme=='b':
+                x = self.encoder(x).image_embeds
+            else:
+                x=self.encoder(x)
+
+
+            features=self.enc2lat(x)
+
             # projected_vec = self.projection(x.pooler_output)
             # projection_len = torch.norm(projected_vec, dim=-1, keepdim=True)
             # features=projected_vec / projection_len
         #mu, logvar = x.chunk(2, dim=1)
         #return self.fc_mu(features), self.fc_var(features), clip_output[:,:-1,:]
-        return features.chunk(2,dim=1)[0], features.chunk(2,dim=1)[1], clip_output[:,:-1,:]
+        if self.scheme == 'a':
+            return features.chunk(2, dim=-1)[0], features.chunk(2, dim=-1)[1], clip_output
+        else:
+            return features.chunk(2,dim=-1)[0], features.chunk(2,dim=-1)[1], clip_output[:,1:,:]
 
 
 class Projection(nn.Module):
@@ -149,10 +180,10 @@ class Projection(nn.Module):
         return embeds
 
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, latent_dim,e_dim, num_attributes, nheads, nlayers, pad_idx):
+    def __init__(self, vocab_size, latent_dim,e_dim, scheme, num_attributes, nheads, nlayers, pad_idx):
         super().__init__()
         hidden_dim = 512
-
+        self.scheme=scheme
         self.num_attributes = num_attributes
 
         if num_attributes==10:
@@ -162,7 +193,7 @@ class TextEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, latent_dim*2)
             )
-        elif num_attributes==49:
+        elif num_attributes==32:
             # self.base = AutoModel.from_pretrained("distilbert-base-multilingual-cased")
             # self.projection = Projection(768, 2*latent_dim)
             # configuration = CLIPTextConfig()
@@ -171,28 +202,35 @@ class TextEncoder(nn.Module):
             # for p in self.base.parameters():
             #     p.requires_grad = False
 
-            #self.base = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
 
             self.e_dim = e_dim
 
             self.embedding = nn.Embedding(vocab_size, e_dim, padding_idx=pad_idx)
             self.pos_encoding = PositionalEncoding(e_dim)
             encoder_layers = TransformerEncoderLayer(d_model=e_dim, nhead=nheads, dim_feedforward=4*latent_dim, dropout=0.2)
-            self.transformer_encoder = TransformerEncoder(encoder_layer=encoder_layers, num_layers=nlayers)
+            if scheme=='d':
+                self.transformer_encoder = CLIPTextModelWithProjection.from_pretrained("openai/clip-vit-base-patch32")
+            else:
+                self.transformer_encoder = TransformerEncoder(encoder_layer=encoder_layers, num_layers=nlayers)
             self.word2sen_hidden = Word2SentenceEmbedding(hdim=e_dim)
             self.hid2latparams = nn.Linear(e_dim, 2 * latent_dim)
+           #  self.hid2latparams=nn.Sequential(
+           #      nn.Linear(e_dim, 128),
+           #      nn.ReLU(),
+           #      nn.Linear(128, 2 * latent_dim)
+           # )
             # for p in self.base.parameters():
             #     p.requires_grad = False
 
 
-        self.mu_head = nn.Linear(latent_dim*2, latent_dim)
-        self.logvar_head = nn.Linear(latent_dim*2, latent_dim)
+        # self.mu_head = nn.Linear(latent_dim*2, latent_dim)
+        # self.logvar_head = nn.Linear(latent_dim*2, latent_dim)
 
-    def forward(self, attributes, pad_mask=None):
+    def forward(self, attributes, attention_mask, pad_mask=None):
 
         if self.num_attributes==10:
             x = self.fc(attributes)
-        elif self.num_attributes==49:
+        elif self.num_attributes==32:
             #out = self.base(attributes, attention_mask=attention_mask)[1]
             # out = self.base(attributes, attention_mask=attention_mask)[0]
             # #out = out[:, 0, :]  # get CLS token output
@@ -202,10 +240,16 @@ class TextEncoder(nn.Module):
             # x=x.mean(dim=1)
 
 
+            if self.scheme=='d':
+                hidden = self.transformer_encoder(attributes.T, attention_mask)
+                hidden=hidden.last_hidden_state
+                hidden=hidden.transpose(0,1)
+                #hidden=torch.permute(hidden,(1,0,2))
+            else:
+                embedded = self.embedding(attributes) * math.sqrt(self.e_dim)
+                embedded = self.pos_encoding(embedded)
+                hidden = self.transformer_encoder(embedded, src_key_padding_mask=pad_mask)
 
-            embedded = self.embedding(attributes) * math.sqrt(self.e_dim)
-            embedded = self.pos_encoding(embedded)
-            hidden = self.transformer_encoder(embedded, src_key_padding_mask=pad_mask)
             hidden = self.word2sen_hidden(hidden)
             x = self.hid2latparams(hidden)
 
@@ -215,13 +259,14 @@ class TextEncoder(nn.Module):
         return mu, logvar
 
 class TextDecoder(nn.Module):
-    def __init__(self, latent_dim, e_dim, num_attributes, vocab_size, device, nheads, nlayers, pad_idx):
+    def __init__(self, scheme, latent_dim, e_dim, num_attributes, vocab_size, device, nheads, nlayers, pad_idx):
         super().__init__()
         self.hidden_dim = 512
         self.num_attributes = num_attributes
         self.device=device
         self.num_layers=2
         self.nhead=8
+        self.scheme=scheme
 
         if num_attributes==10:
             self.fc = nn.Sequential(
@@ -231,7 +276,7 @@ class TextDecoder(nn.Module):
                 nn.Linear(self.hidden_dim, num_attributes),
                 nn.Sigmoid()
             )
-        elif num_attributes==49:
+        elif num_attributes==32:
         #     self.fc = nn.Sequential(
         #     nn.Linear(latent_dim, 2048),
         #     nn.LeakyReLU(0.2),
@@ -255,11 +300,21 @@ class TextDecoder(nn.Module):
             self.embedding = nn.Embedding(vocab_size, e_dim, padding_idx=pad_idx)
             self.pos_encoding = PositionalEncoding(e_dim)
             self.lat2hid = nn.Linear(latent_dim, e_dim)
+           #  self.lat2hid = nn.Sequential(
+           #      nn.Linear(latent_dim, 128),
+           #      nn.ReLU(),
+           #      nn.Linear(128, e_dim),
+           # )
             decoder_layers = TransformerDecoderLayer(d_model=e_dim, nhead=nheads, dim_feedforward=4*latent_dim, dropout=0.2)
             self.transformer_decoder = TransformerDecoder(decoder_layer=decoder_layers, num_layers=nlayers)
             self.hid2logits = nn.Linear(e_dim, vocab_size)
 
-            self.img2input=nn.Linear(768, e_dim)
+            if scheme=='a':
+                self.img2input = nn.Linear(512, e_dim)
+            else:
+                self.img2input=nn.Linear(768, e_dim)
+
+            self.interpolation = nn.AdaptiveAvgPool1d(self.num_attributes)
 
 
 
@@ -268,7 +323,7 @@ class TextDecoder(nn.Module):
 
         if self.num_attributes == 10:
             attribute_probs = self.fc(z)
-        elif self.num_attributes==49:
+        elif self.num_attributes==32:
             # #x = attribute_probs.view(-1,512,8,4)
             #batch_size = z.size(0)
             # #x_flat = x.view(batch_size,512,-1).permute(2,0,1)
@@ -311,11 +366,21 @@ class TextDecoder(nn.Module):
 
 
             if sentences.dtype==torch.int64:
+
                 embedded_targets = self.embedding(sentences) * math.sqrt(self.e_dim)
                 embedded_targets = self.pos_encoding(embedded_targets)
             else:
                 embedded_targets = self.img2input(sentences)
-                embedded_targets=embedded_targets.transpose(0,1)
+                if self.scheme=='a':
+                    embedded_targets=embedded_targets.unsqueeze(0)
+                    embedded_targets=embedded_targets.repeat(self.num_attributes, 1,1)
+                else:
+                    embedded_targets = self.pos_encoding(embedded_targets)
+                    embedded_targets = embedded_targets.transpose(1, 2)
+                    embedded_targets = self.interpolation(embedded_targets)
+                    embedded_targets = torch.permute(embedded_targets, [2,0,1])
+
+
 
 
             hidden = self.transformer_decoder(embedded_targets, memories, tgt_mask=tgt_mask,
@@ -329,17 +394,19 @@ class ImageDecoder(nn.Module):
     def __init__(self, latent_dim, dataset):
         super().__init__()
 
-        self.decoder_input = nn.Sequential(
-            nn.Linear(latent_dim, 2048),
-            nn.LeakyReLU(0.2),
-            ResidualLinear(2048),
-            nn.Linear(2048, 512 * 4 * 4),
-            nn.LeakyReLU(0.2)
-        )
 
-        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8)
 
         if dataset=='CelebAMask-HQ':
+
+            self.decoder_input = nn.Sequential(
+                nn.Linear(latent_dim, 2048),
+                nn.LeakyReLU(0.2),
+                ResidualLinear(2048),
+                nn.Linear(2048, 512 * 4 * 4),
+                nn.LeakyReLU(0.2)
+            )
+
+            self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8)
 
             self.decoder = nn.Sequential(
                 nn.ConvTranspose2d(512, 512, 4, 2, 1),
@@ -368,6 +435,29 @@ class ImageDecoder(nn.Module):
 
 
         elif dataset== 'Flickr30k':
+
+            self.decoder_input = nn.Sequential(
+                nn.Linear(latent_dim, 512),
+                nn.LeakyReLU(0.2),
+                ResidualLinear(512),
+                nn.Linear(512, 2048),
+                nn.LeakyReLU(0.2),
+                ResidualLinear(2048),
+                nn.Linear(2048, 512 * 4 * 4),
+                nn.LeakyReLU(0.2)
+            )
+
+
+            # self.decoder_input = nn.Sequential(
+            #     nn.Linear(latent_dim, 2048),
+            #     nn.LeakyReLU(0.2),
+            #     ResidualLinear(2048),
+            #     nn.Linear(2048, 512 * 4 * 4),
+            #     nn.LeakyReLU(0.2)
+            # )
+
+
+            self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8)
 
             self.decoder = nn.Sequential(
                 nn.ConvTranspose2d(512, 512, 4, 2, 1),
@@ -419,21 +509,22 @@ class ImageDecoder(nn.Module):
         return self.decoder(x)
 
 class MultimodalVAE(nn.Module):
-    def __init__(self, device,tokenizer, vocab_size, dataset, latent_dim=32, e_dim=512, nheads=8, nlayers=4, pad_token_id=0, num_attributes=10,  temperature=1.0):
+    def __init__(self, device,tokenizer, vocab_size, scheme, dataset, latent_dim=32, e_dim=512, nheads=8, nlayers=4, pad_token_id=0, num_attributes=10,  temperature=1.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_attributes = num_attributes
         self.temperature = temperature
+        self.scheme = scheme
 
         self.dataset=dataset
         self.device = device
         self.vocab_size=tokenizer.tokenizer.vocab_size
         self.tokenizer = tokenizer
 
-        self.image_encoder = ImageEncoder(latent_dim,dataset)
-        self.text_encoder = TextEncoder(vocab_size, latent_dim, e_dim, num_attributes, nheads, nlayers, pad_token_id)
+        self.image_encoder = ImageEncoder(latent_dim,dataset, scheme)
+        self.text_encoder = TextEncoder(vocab_size, latent_dim, e_dim, scheme, num_attributes, nheads, nlayers, pad_token_id)
         self.image_decoder = ImageDecoder(latent_dim, dataset)
-        self.text_decoder = TextDecoder(latent_dim, e_dim, num_attributes, self.vocab_size, self.device, nheads, nlayers, pad_token_id)
+        self.text_decoder = TextDecoder(scheme, latent_dim, e_dim, num_attributes, self.vocab_size, self.device, nheads, nlayers, pad_token_id)
 
         self.norm_layer = nn.LayerNorm(latent_dim)
 
@@ -486,8 +577,8 @@ class MultimodalVAE(nn.Module):
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var, clip_output
 
-    def encode_text(self, attributes, pad_mask):
-        mu, log_var = self.text_encoder(attributes,  pad_mask)
+    def encode_text(self, attributes, attention_mask, pad_mask):
+        mu, log_var = self.text_encoder(attributes, attention_mask, pad_mask)
         z = self.reparameterize(mu, log_var)
         return z, mu, log_var
 
@@ -501,7 +592,7 @@ class MultimodalVAE(nn.Module):
     #     descriptions = self._attributes_to_text(pred_attributes)
     #     return attr_probs, pred_attributes, descriptions
 
-    def forward(self, train_phase, images=None, target_attributes=None, pad_mask=None, tgt_mask=None, pad_id=0):
+    def forward(self, train_phase, images=None, target_attributes=None, attention_mask=None, pad_mask=None, tgt_mask=None, pad_id=0):
         outputs = {}
 
 
@@ -540,7 +631,7 @@ class MultimodalVAE(nn.Module):
 
 
 
-                z_text, text_mu, text_log_var = self.encode_text(target_attributes, pad_mask)
+                z_text, text_mu, text_log_var = self.encode_text(target_attributes, attention_mask, pad_mask)
 
                 outputs['text_mu'] = text_mu
                 outputs['text_log_var'] = text_log_var
@@ -595,10 +686,10 @@ class MultimodalVAE(nn.Module):
         return 1 / (1 + kl_match)
 
     # @torch.no_grad()
-    def generate_from_text(self, attributes, pad_mask):
+    def generate_from_text(self, attributes, attention_mask, pad_mask):
         device = next(self.parameters()).device
         attributes_t = attributes.to(device)
-        z_text, _, _ = self.encode_text(attributes_t, pad_mask)
+        z_text, _, _ = self.encode_text(attributes_t, attention_mask, pad_mask)
         #z_t2i = z_text.mean(dim=0).squeeze(0)
         return self.decode_image(z_text)
 

@@ -57,8 +57,7 @@ def evaluate_all_metrics(gts, res):
 
 
 
-    print(gts)
-    print(res)
+
     # METEOR
     try:
         meteor, meteor_ind = Meteor().compute_score(gts, res)
@@ -107,20 +106,25 @@ def evaluate_all_metrics(gts, res):
 
 
 class TrainingManager:
-    def __init__(self, kl_coef, lr, save_dir='training'):
+    def __init__(self, kl_coef, lr, latent_dim, scheme, save_dir='training'):
         self.save_dir = save_dir
         os.makedirs(save_dir,exist_ok=True)
-        self.history_path = os.path.join(save_dir,'history_'+str(kl_coef)+'_lr_'+str(lr)+'.csv')
+        self.history_path = os.path.join(save_dir,'history_'+str(kl_coef)+'_lr_'+str(lr)+'_latent_dim_'+str(latent_dim)+
+                                         '_scheme_'+str(scheme)+'.csv')
         self.history=[]
-        self.info_path = os.path.join(save_dir,'run_info_'+str(kl_coef)+'_lr_'+str(lr)+'.json')
+        self.info_path = os.path.join(save_dir,'run_info_'+str(kl_coef)+'_lr_'+str(lr)+'_latent_dim_'+str(latent_dim)+
+                                      '_scheme_'+str(scheme)+'.json')
         self.kl_coef=kl_coef
         self.lr=lr
+        self.latent_dim=latent_dim
 
 
-    def save_checkpoint(self, epoch, model, discriminator, optimizer_G, optimizer_D, loss, phase):
-        phase_checkpoint_dir = os.path.join(self.save_dir, 'checkpoints', str(self.kl_coef)+'_lr_'+str(self.lr)+'_', f'phase{phase}')
+    def save_checkpoint(self, epoch, model, discriminator, optimizer_G, optimizer_D, loss, phase, scheme):
+        phase_checkpoint_dir = os.path.join(self.save_dir, 'checkpoints', str(self.kl_coef)+'_lr_'+str(self.lr)+'_latent_dim_'+str(self.latent_dim)+'_scheme_'+scheme,
+                                            f'phase{phase}')
         os.makedirs(phase_checkpoint_dir, exist_ok=True)
-        checkpoint_path = os.path.join(phase_checkpoint_dir,f'checkpoint_epoch_{epoch}_kl_coef_{self.kl_coef}_lr_{self.lr}.pt')
+        checkpoint_path = os.path.join(phase_checkpoint_dir,f'checkpoint_epoch_{epoch}_kl_coef_{self.kl_coef}_lr_{self.lr}_latent_dim_{self.latent_dim}'
+                                                            f'.pt')
         torch.save({
             'epoch':epoch,
             'model_state_dict':model.state_dict(),
@@ -147,7 +151,7 @@ class TrainingManager:
         df = pd.DataFrame(self.history)
         df.to_csv(self.history_path,index=False)
 
-def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, epoch, phase_config, clip_tokenizer):
+def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, epoch, phase_config, clip_tokenizer, scheme):
     images = batch['image'].to(device)
     if phase_config['dataset']=='CelebAMask-HQ':
         target_attributes = batch['attributes'].to(device) if 'attributes' in batch else None
@@ -165,7 +169,7 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
 
         pad_idx = clip_tokenizer.tokenizer.pad_token_id
 
-    outputs = model(True, images=images, target_attributes=target_attributes, pad_mask=pad_mask, tgt_mask=tgt_mask, pad_id=pad_idx)
+    outputs = model(True, images=images, target_attributes=target_attributes, attention_mask=attention_mask, pad_mask=pad_mask, tgt_mask=tgt_mask, pad_id=pad_idx)
 
     # if phase_config['dataset'] == 'Flickr30k':
     #     pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1).float()
@@ -592,7 +596,7 @@ def evaluate_model(model, discriminator, test_loader, device, epoch, phase_confi
     return metrics
 
 def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer,
-                  config, val_subset, start_epoch, kl_coef):
+                  config, val_subset, start_epoch, kl_coef, scheme):
     print("\nStarting Phase 1: Early Training")
     phase_config = config['phase_configs'][1]
     phase_config['dataset']=config['dataset']
@@ -605,7 +609,7 @@ def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader
             discriminator.train()
             train_metrics=defaultdict(float)
             for batch in tqdm(train_loader, desc=f"Phase 1 - Epoch {epoch+1}/{num_epochs}"):
-                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer)
+                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer, scheme)
                 for k,v in metrics.items():
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
@@ -619,8 +623,9 @@ def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader
                 if phase_config['dataset'] == 'CelebAMask-HQ':
                     eval_metrics = evaluate_model(model, discriminator, val_loader, device, epoch + 1, phase_config,clip_tokenizer)
                 from src.visualization import visualize_results
-                results_dir = visualize_results(phase_config['dataset'], clip_tokenizer, kl_coef, optimizer_G.param_groups[0]['lr'],
-                                                model,val_subset,epoch+1,"phase1",num_samples=config['num_vis_samples'],device=device)
+                results_dir = visualize_results(phase_config['dataset'], clip_tokenizer, scheme, kl_coef, optimizer_G.param_groups[0]['lr'],
+                                                model,val_subset,epoch+1,"phase1", config['latent_dim'],
+                                                num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 1 - Visualization results saved to {results_dir}")
 
             combined_metrics = {
@@ -642,10 +647,12 @@ def train_phase_1(model, discriminator, clip_tokenizer, train_loader, val_loader
             for k,v in val_metrics.items():
                 print(f"  {k}: {v:.4f}")
 
-        trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=1)
-    return best_val_loss,best_epoch
+        trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=1,
+                                scheme=scheme)
+    return best_val_loss,best_epoch, epoch
 
-def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
+def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer,
+                  config, val_subset, start_epoch, kl_coef, scheme):
     print("\nStarting Phase 2: Middle Training")
     phase_config = config['phase_configs'][2]
     phase_config['dataset'] = config['dataset']
@@ -660,7 +667,7 @@ def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader
 
             train_metrics=defaultdict(float)
             for batch in tqdm(train_loader, desc=f"Phase 2 - Epoch {epoch+1}/{num_epochs}"):
-                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config,clip_tokenizer)
+                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config,clip_tokenizer, scheme)
                 for k,v in metrics.items():
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
@@ -674,8 +681,8 @@ def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader
                 if phase_config['dataset']=='CelebAMask-HQ':
                     eval_metrics=evaluate_model(model,discriminator,val_loader,device,epoch+1,phase_config, clip_tokenizer)
                 from src.visualization import visualize_results
-                results_dir = visualize_results(phase_config['dataset'], clip_tokenizer, kl_coef, optimizer_G.param_groups[0]['lr'],
-                                                model,val_subset,epoch+1,"phase2",num_samples=config['num_vis_samples'],device=device)
+                results_dir = visualize_results(phase_config['dataset'], clip_tokenizer, scheme, kl_coef, optimizer_G.param_groups[0]['lr'],
+                                                model,val_subset,epoch+1,"phase2", config['latent_dim'], num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 2 - Visualization results saved to {results_dir}")
 
             combined_metrics={
@@ -697,10 +704,12 @@ def train_phase_2(model, discriminator, clip_tokenizer, train_loader, val_loader
             for k,v in val_metrics.items():
                 print(f"  {k}: {v:.4f}")
 
-        trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=2)
-    return best_val_loss,best_epoch
+        trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=2,
+                                scheme=scheme)
+    return best_val_loss,best_epoch, epoch
 
-def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loader, optimizer_G, optimizer_D, device, num_epochs, trainer, config, val_subset, start_epoch, kl_coef):
+def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loader, optimizer_G, optimizer_D, device,
+                  num_epochs, trainer, config, val_subset, start_epoch, kl_coef, scheme):
     print("\nStarting Phase 3: Late Training")
     phase_config = config['phase_configs'][3]
     phase_config['dataset'] = config['dataset']
@@ -715,7 +724,7 @@ def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loade
 
             train_metrics=defaultdict(float)
             for batch in tqdm(train_loader, desc=f"Phase 3 - Epoch {epoch+1}/{num_epochs}"):
-                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer)
+                metrics = train_step(model,discriminator,batch,optimizer_G,optimizer_D,device,epoch,phase_config, clip_tokenizer, scheme)
                 for k,v in metrics.items():
                     train_metrics[k]+=v
             train_metrics={k:v/len(train_loader) for k,v in train_metrics.items()}
@@ -729,8 +738,8 @@ def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loade
                 if phase_config['dataset'] == 'CelebAMask-HQ':
                     eval_metrics = evaluate_model(model, discriminator, val_loader, device, epoch + 1, phase_config, clip_tokenizer)
                 from src.visualization import visualize_results
-                results_dir=visualize_results(phase_config['dataset'], clip_tokenizer, kl_coef, optimizer_G.param_groups[0]['lr'],
-                                              model,val_subset,epoch+1,"phase3",num_samples=config['num_vis_samples'],device=device)
+                results_dir=visualize_results(phase_config['dataset'], clip_tokenizer, scheme, kl_coef, optimizer_G.param_groups[0]['lr'],
+                                              model,val_subset,epoch+1,"phase3", config['latent_dim'], num_samples=config['num_vis_samples'],device=device)
                 print(f"Phase 3 - Visualization results saved to {results_dir}")
 
             combined_metrics={
@@ -752,11 +761,12 @@ def train_phase_3(model, discriminator, clip_tokenizer, train_loader,  val_loade
             for k,v in val_metrics.items():
                 print(f"  {k}: {v:.4f}")
 
-        trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=3)
-    return best_val_loss,best_epoch
+        trainer.save_checkpoint(epoch=num_epochs,model=model,discriminator=discriminator,optimizer_G=optimizer_G,optimizer_D=optimizer_D,loss=val_metrics['val_total_loss'],phase=3,
+                                scheme=scheme)
+    return best_val_loss,best_epoch, epoch
 
 def run_phased_training(model, discriminator, clip_tokenizer, train_loader, val_loader, optimizer_G, optimizer_D,
-                       device, config, trainer, val_subset, phase1_epochs, phase2_epochs, phase3_epochs,
+                       device, config, trainer, val_subset, scheme, phase1_epochs, phase2_epochs, phase3_epochs,
                        phase1_start=0, phase2_start=0, phase3_start=0, kl_coef=1):
 
     total_epochs=phase1_epochs+phase2_epochs+phase3_epochs
@@ -767,32 +777,44 @@ def run_phased_training(model, discriminator, clip_tokenizer, train_loader, val_
     print(f"Total: {total_epochs} epochs")
 
     best_losses=[]
+    epoch_1=None
+    epoch_2=None
+    epoch_3=None
 
     if phase1_epochs>0:
         print(f"\nPhase 1: Early Training (Reconstruction Focus)")
-        phase1_loss,phase1_best = train_phase_1(
+        phase1_loss,phase1_best, epoch_1 = train_phase_1(
             model,discriminator, clip_tokenizer, train_loader,val_loader,optimizer_G,optimizer_D,
-            device,phase1_epochs,trainer,config,val_subset,phase1_start, kl_coef
+            device,phase1_epochs,trainer,config,val_subset,phase1_start, kl_coef, scheme
         )
         print(f"\nPhase 1 completed. Best loss: {phase1_loss:.4f} at epoch {phase1_best+1}")
         best_losses.append(phase1_loss)
 
     if phase2_epochs>0:
         print(f"\nPhase 2: Middle Training (Alignment Focus)")
-        phase2_loss,phase2_best = train_phase_2(
+        phase2_loss,phase2_best, epoch_2 = train_phase_2(
             model,discriminator, clip_tokenizer, train_loader,val_loader,optimizer_G,optimizer_D,
-            device,phase2_epochs,trainer,config,val_subset,phase2_start, kl_coef
+            device,phase2_epochs,trainer,config,val_subset,phase2_start, kl_coef, scheme
         )
         print(f"\nPhase 2 completed. Best loss: {phase2_loss:.4f} at epoch {phase2_best+1}")
         best_losses.append(phase2_loss)
 
     if phase3_epochs>0:
         print(f"\nPhase 3: Late Training (Refinement Focus)")
-        phase3_loss,phase3_best = train_phase_3(
+        phase3_loss,phase3_best, epoch_3 = train_phase_3(
             model,discriminator, clip_tokenizer, train_loader,val_loader,optimizer_G,optimizer_D,
-            device,phase3_epochs,trainer,config,val_subset,phase3_start, kl_coef
+            device,phase3_epochs,trainer,config,val_subset,phase3_start, kl_coef, scheme
         )
         print(f"\nPhase 3 completed. Best loss: {phase3_loss:.4f} at epoch {phase3_best+1}")
         best_losses.append(phase3_loss)
 
-    return min(best_losses) if best_losses else float('inf')
+
+    if epoch_3 != None:
+        epoch=epoch_3
+    elif epoch_2 != None:
+        epoch=epoch_2
+    elif epoch_1 != None:
+        epoch=epoch_1
+    else:epoch=0
+
+    return min(best_losses) if best_losses else float('inf'), epoch

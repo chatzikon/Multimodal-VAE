@@ -234,8 +234,8 @@ class VisualizationUtils:
         plt.savefig(os.path.join(self.save_dir,f'comparisons_epoch_{epoch}.png'))
         plt.close()
 
-def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoch, phase_name, num_samples=5, device='cuda'):
-    viz = VisualizationUtils(save_dir=f'results/{phase_name}_kl_coef_{kl_coef}_lr_{lr}')
+def visualize_results(dataset, tokenizer, scheme, kl_coef, lr, model, test_dataset, epoch, phase_name, latent_dim, num_samples=5, device='cuda'):
+    viz = VisualizationUtils(save_dir=f'results/{phase_name}_kl_coef_{kl_coef}_lr_{lr}_latent_dim_{latent_dim}_scheme_{scheme}')
     samples = [test_dataset[i] for i in range(min(num_samples,len(test_dataset)))]
     images = torch.stack([s['image'] for s in samples]).to(device)
     texts = [s['caption'] for s in samples]
@@ -281,14 +281,14 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
                 text_attrs = text_attrs.unsqueeze(0).to(device)
                 attention_mask=torch.ones(1)
                 text_attrs_v=[text_attrs,attention_mask]
-                generated_image = model.generate_from_text(text_attrs_v)
+                generated_image = model.generate_from_text(text_attrs_v, attention_mask )
                 generated_images.append(generated_image[0])
             generated_images = torch.stack(generated_images)
 
 
         elif dataset=='Flickr30k':
             pad_mask = (text_attrs == pad_id).transpose(0,1)
-            generated_images = model.generate_from_text(text_attrs, pad_mask)
+            generated_images = model.generate_from_text(text_attrs, attention_mask, pad_mask)
 
 
         reconstructed_images = model.decode_image(model.encode_image(images)[0])
@@ -297,7 +297,7 @@ def visualize_results(dataset, tokenizer, kl_coef, lr, model, test_dataset, epoc
             attributes = torch.stack([s['attributes'] for s in samples]).to(device)
             z_text, _, _ = model.encode_text(attributes,attention_mask)
         elif dataset=='Flickr30k':
-            z_text, _, _ = model.encode_text(text_attrs, pad_mask)
+            z_text, _, _ = model.encode_text(text_attrs, attention_mask, pad_mask)
 
         # target_attributes_s = shift_right(
         #     target_attributes,
