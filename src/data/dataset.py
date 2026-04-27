@@ -12,6 +12,8 @@ from functools import lru_cache
 from torchvision import transforms
 from .utils import clean_and_validate_attributes, generate_natural_description, remove_punc_special
 
+
+
 def cache_dataset(dataset, cache_file):
     with open(cache_file, 'wb') as f:
         pickle.dump(dataset, f)

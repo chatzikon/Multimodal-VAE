@@ -2,15 +2,14 @@ import subprocess
 import sys
 
 kl_coef = 1
-lr = 1e-2
-latent_dim=64
+lr = 1e-4
+latent_dim=[512]
 #scheme=['d']
-scheme=['a', 'b', 'c', 'd']
+scheme=[  'c']
+#embedding=[128,512]
 
 
-
-
-for i in range(len(scheme)):
+for i in range(len(latent_dim)):
 
 
         lrD = lr/ 10
@@ -25,11 +24,12 @@ for i in range(len(scheme)):
             "--lrG", str(lrG),
             "--lrD", str(lrD),
             "--reconst_vis", "1",
-            "--multiphase", "0",
-            "--latent_dim", str(lat),
-            "--scheme", scheme[i],
-            "--resume_phase", str(None),
-            "--resume_epoch", str(None)
+            "--multiphase", "1",
+            "--latent_dim", str(lat[i]),
+            "--scheme", scheme[0],
+            "--resume_phase", str(0),
+            "--resume_epoch", str(None),
+            "--batch_size", str(1),
         ]
 
 

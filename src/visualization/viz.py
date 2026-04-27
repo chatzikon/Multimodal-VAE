@@ -254,9 +254,10 @@ def visualize_results(dataset, tokenizer, scheme, kl_coef, lr, model, test_datas
         elif not isinstance(generated_texts,list):
             generated_texts = generated_texts.split(" ")
 
-        pad_id = tokenizer.tokenizer.pad_token_id
-        eos_idx = tokenizer.tokenizer.eos_token_id
-        sos_idx = tokenizer.tokenizer.bos_token_id
+        if dataset == 'Flickr30k':
+            pad_id = tokenizer.tokenizer.pad_token_id
+            eos_idx = tokenizer.tokenizer.eos_token_id
+            sos_idx = tokenizer.tokenizer.bos_token_id
 
 
         if dataset=='CelebAMask-HQ':
@@ -281,7 +282,7 @@ def visualize_results(dataset, tokenizer, scheme, kl_coef, lr, model, test_datas
                 text_attrs = text_attrs.unsqueeze(0).to(device)
                 attention_mask=torch.ones(1)
                 text_attrs_v=[text_attrs,attention_mask]
-                generated_image = model.generate_from_text(text_attrs_v, attention_mask )
+                generated_image = model.generate_from_text(text_attrs_v[0], attention_mask, None )
                 generated_images.append(generated_image[0])
             generated_images = torch.stack(generated_images)
 
@@ -295,38 +296,41 @@ def visualize_results(dataset, tokenizer, scheme, kl_coef, lr, model, test_datas
 
         if dataset == 'CelebAMask-HQ':
             attributes = torch.stack([s['attributes'] for s in samples]).to(device)
-            z_text, _, _ = model.encode_text(attributes,attention_mask)
+            z_text, _, _ = model.encode_text(attributes,attention_mask, None)
+
+            attr_probs_alt, pred_attributes = model.text_decoder(z_text, text_attrs, tgt_mask=None, tgt_pad_mask=None)
+
         elif dataset=='Flickr30k':
             z_text, _, _ = model.encode_text(text_attrs, attention_mask, pad_mask)
 
-        # target_attributes_s = shift_right(
-        #     target_attributes,
-        #     pad_token_id=pad_id
-        # )
-        #############
-        # first target is <sos>
-        sen = torch.ones(1, 5).fill_(sos_idx).type(torch.long).to(device)
-        for i in range(tokenizer.max_length - 1):
-            # create mask
-            mask = (torch.triu(torch.ones((len(sen), len(sen)), device=device)) == 1).transpose(0, 1)
-            mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-            # decode
-            #out = self.decoder(z, sen, tgt_mask=mask, tgt_pad_mask=None)
-            out, _ = model.text_decoder(z_text, sen, tgt_mask=mask, tgt_pad_mask=None)
+            # target_attributes_s = shift_right(
+            #     target_attributes,
+            #     pad_token_id=pad_id
+            # )
+            #############
+            # first target is <sos>
+            sen = torch.ones(1, 5).fill_(sos_idx).type(torch.long).to(device)
+            for i in range(tokenizer.max_length - 1):
+                # create mask
+                mask = (torch.triu(torch.ones((len(sen), len(sen)), device=device)) == 1).transpose(0, 1)
+                mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+                # decode
+                #out = self.decoder(z, sen, tgt_mask=mask, tgt_pad_mask=None)
+                out, _ = model.text_decoder(z_text, sen, tgt_mask=mask, tgt_pad_mask=None)
 
-            next_word_prob = out[-1].squeeze()
-            next_word = torch.argmax(next_word_prob,  dim=-1)
-            #next_word = next_word.tolist()
+                next_word_prob = out[-1].squeeze()
+                next_word = torch.argmax(next_word_prob,  dim=-1)
+                #next_word = next_word.tolist()
 
-            # add decoded word to sentence
-            #sen = torch.cat([sen, torch.ones(1, 5).fill_(next_word).type(torch.long).to(device)], dim=0)
-            sen = torch.cat([sen, next_word.unsqueeze(0).to(device)], dim=0)
-            # if next_word == eos_idx:
-            #     break
+                # add decoded word to sentence
+                #sen = torch.cat([sen, torch.ones(1, 5).fill_(next_word).type(torch.long).to(device)], dim=0)
+                sen = torch.cat([sen, next_word.unsqueeze(0).to(device)], dim=0)
+                # if next_word == eos_idx:
+                #     break
 
-        ####alt#####
-        pad_mask, tgt_mask = create_masks(text_attrs, pad_token=tokenizer.tokenizer.pad_token_id)
-        attr_probs_alt, _ = model.text_decoder(z_text, text_attrs, tgt_mask=tgt_mask, tgt_pad_mask=pad_mask)
+            ####alt#####
+            pad_mask, tgt_mask = create_masks(text_attrs, pad_token=tokenizer.tokenizer.pad_token_id)
+            attr_probs_alt, _ = model.text_decoder(z_text, text_attrs, tgt_mask=tgt_mask, tgt_pad_mask=pad_mask)
 
         if dataset == 'Flickr30k':
             # embedding_weights = F.normalize(model.text_encoder.base.text_model.embeddings.token_embedding.weight, dim=0)
@@ -365,7 +369,8 @@ def visualize_results(dataset, tokenizer, scheme, kl_coef, lr, model, test_datas
 
     viz.save_img2text_results(images.detach().cpu(), generated_texts, texts, epoch)
     viz.save_text_recon_results(input_texts=texts, recon_texts=recon_texts, epoch=epoch)
-    viz.save_text_recon_results_alt(input_texts=texts, recon_texts=recon_texts_alt, epoch=epoch)
+    if dataset == 'Flickr30k':
+        viz.save_text_recon_results_alt(input_texts=texts, recon_texts=recon_texts_alt, epoch=epoch)
 
 
 
@@ -383,7 +388,7 @@ def visualize_results(dataset, tokenizer, scheme, kl_coef, lr, model, test_datas
                         if attr_key == attribute_name:
                             text_attrs[0,idx] = 1.0
                 with torch.no_grad():
-                    manipulated_image = model.generate_from_text(text_attrs)
+                    manipulated_image = model.generate_from_text(text_attrs, None, None)
                 manipulated_images.append(manipulated_image[0].detach().cpu())
 
             viz.save_attribute_manipulation(base_image.detach().cpu(), manipulated_images, attributes_to_add, epoch)

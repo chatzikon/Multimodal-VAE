@@ -42,7 +42,8 @@ class Tokenizer:
 
 
 
-def main(kl_coef, lr_G,lr_D, reconst_vis, multiphase, latent_dim,scheme, resume_phase, resume_epoch):
+def main(kl_coef, lr_G,lr_D, reconst_vis, multiphase, latent_dim,scheme, resume_phase, resume_epoch,
+         batch_size):
 
 
 
@@ -57,11 +58,13 @@ def main(kl_coef, lr_G,lr_D, reconst_vis, multiphase, latent_dim,scheme, resume_
     config['resume_phase']=resume_phase
     config['resume_epoch']=resume_epoch
 
+    config['batch_size']=batch_size
+
 
     if multiphase:
         config['phase1_epochs'] = 40
         config['phase2_epochs'] = 30
-        config['phase3_epochs'] = 70
+        config['phase3_epochs'] = 0
 
 
     if scheme=='d':
@@ -87,7 +90,13 @@ def main(kl_coef, lr_G,lr_D, reconst_vis, multiphase, latent_dim,scheme, resume_
         clip_tokenizer=None
         vocab_size=0
 
-        model = MultimodalVAE(vocab_size, dataset=config['dataset'], latent_dim=config['latent_dim'], temperature=1.0).to(device)
+        model = MultimodalVAE(device, clip_tokenizer, vocab_size, scheme,
+                              dataset=config['dataset'], latent_dim=config['latent_dim'],
+                              e_dim=config['embedding_dim'], nheads=config['nheads'],
+                              nlayers=config['nlayers'], pad_token_id=0,
+                              num_attributes=10,
+
+                              temperature=1.0).to(device)
 
     elif config['dataset'] == 'Flickr30k':
 
@@ -205,18 +214,28 @@ def main(kl_coef, lr_G,lr_D, reconst_vis, multiphase, latent_dim,scheme, resume_
     phase2_start = 0
     phase3_start = 0
 
+    print(config['resume_phase'])
+    print(config['resume_epoch'])
+
     if config['resume_phase'] in [1,2,3] and config['resume_epoch']:
        #checkpoint_path = f"training/checkpoints/phase{config['resume_phase']}/checkpoint_epoch_{config['resume_epoch']}.pt"
-        checkpoint_path = ('/home/chatziko/PycharmProjects/PythonProject/Multimodal-VAE/results/results_flickr_both_modalities_kl_1_latent_dim_var/'
-                          'latent_64/final_model_kl_coef_1.0_lr_0.01_latent_dim_64.pt')
+
+        checkpoint_path = ('/home/chatziko/PycharmProjects/PythonProject/Multimodal-VAE/training/checkpoints/'
+                           '1.0_lr_0.01_latent_dim_64_scheme_c/phase2/'
+                           'checkpoint_epoch_60_kl_coef_1.0_lr_0.01_latent_dim_64.pt')
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path)
             model.load_state_dict(checkpoint['model_state_dict'])
             discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
             optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
             optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
-            #start_epoch = checkpoint['epoch']
-            start_epoch = 40
+            start_epoch = checkpoint['epoch']
+
+            if start_epoch==config['phase1_epochs'] or start_epoch==config['phase2_epochs']:
+                config['resume_phase']+=1
+                start_epoch = 0
+
+
             print(f"Resuming phase {config['resume_phase']} from epoch {start_epoch+1}")
             if config['resume_phase']==1:
                 phase1_start=start_epoch
@@ -286,8 +305,10 @@ if __name__ == "__main__":
         parser.add_argument("--multiphase", type=int, default=0)
         parser.add_argument("--latent_dim", type=int, default=64)
         parser.add_argument("--scheme", type=str, default='c')
-        parser.add_argument("--resume_phase", type=str, default=0)
-        parser.add_argument("--resume_epoch", type=str, default=False)
+        parser.add_argument("--resume_phase", type=int, default=0)
+        parser.add_argument("--resume_epoch", type=bool, default=False)
+        parser.add_argument("--batch_size", type=int, default=16)
+
 
         args = parser.parse_args()
 
@@ -300,7 +321,8 @@ if __name__ == "__main__":
             latent_dim=args.latent_dim,
             scheme=args.scheme,
             resume_phase=args.resume_phase,
-            resume_epoch=args.resume_epoch
+            resume_epoch=args.resume_epoch,
+            batch_size=16,
         )
 
     import subprocess

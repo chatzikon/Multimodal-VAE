@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torchvision.models import vgg16, VGG16_Weights
 
 from .components import ResidualBlock, ResidualLinear
-from ..training.losses import identity_consistency_loss, compute_distribution_matching_loss
 from ..data.utils import clean_and_validate_attributes, generate_natural_description
+
 
 
 from transformers import CLIPVisionModelWithProjection, CLIPTextModelWithProjection
@@ -136,6 +136,9 @@ class ImageEncoder(nn.Module):
 
         if self.dataset == 'CelebAMask-HQ':
             features = self.encoder(x)
+            clip_output=0
+            return self.fc_mu(features), self.fc_var(features), clip_output
+
         elif self.dataset == 'Flickr30k':
 
             if self.scheme == 'a':
@@ -193,6 +196,9 @@ class TextEncoder(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, latent_dim*2)
             )
+
+            self.mu_head = nn.Linear(latent_dim*2, latent_dim)
+            self.logvar_head = nn.Linear(latent_dim*2, latent_dim)
         elif num_attributes==32:
             # self.base = AutoModel.from_pretrained("distilbert-base-multilingual-cased")
             # self.projection = Projection(768, 2*latent_dim)
@@ -223,13 +229,14 @@ class TextEncoder(nn.Module):
             #     p.requires_grad = False
 
 
-        # self.mu_head = nn.Linear(latent_dim*2, latent_dim)
-        # self.logvar_head = nn.Linear(latent_dim*2, latent_dim)
+
 
     def forward(self, attributes, attention_mask, pad_mask=None):
 
         if self.num_attributes==10:
             x = self.fc(attributes)
+            mu = self.mu_head(x)
+            logvar = self.logvar_head(x)
         elif self.num_attributes==32:
             #out = self.base(attributes, attention_mask=attention_mask)[1]
             # out = self.base(attributes, attention_mask=attention_mask)[0]
@@ -253,9 +260,8 @@ class TextEncoder(nn.Module):
             hidden = self.word2sen_hidden(hidden)
             x = self.hid2latparams(hidden)
 
-        # mu = self.mu_head(x)
-        # logvar = self.logvar_head(x)
-        mu, logvar = x.chunk(2, dim=1)
+
+            mu, logvar = x.chunk(2, dim=1)
         return mu, logvar
 
 class TextDecoder(nn.Module):
@@ -518,13 +524,19 @@ class MultimodalVAE(nn.Module):
 
         self.dataset=dataset
         self.device = device
-        self.vocab_size=tokenizer.tokenizer.vocab_size
+
+        if dataset=='Flickr30k':
+            self.vocab_size=tokenizer.tokenizer.vocab_size
+        elif dataset=='CelebAMask-HQ':
+            self.vocab_size =0
+
         self.tokenizer = tokenizer
 
         self.image_encoder = ImageEncoder(latent_dim,dataset, scheme)
         self.text_encoder = TextEncoder(vocab_size, latent_dim, e_dim, scheme, num_attributes, nheads, nlayers, pad_token_id)
         self.image_decoder = ImageDecoder(latent_dim, dataset)
-        self.text_decoder = TextDecoder(scheme, latent_dim, e_dim, num_attributes, self.vocab_size, self.device, nheads, nlayers, pad_token_id)
+        self.text_decoder = TextDecoder(scheme, latent_dim, e_dim, num_attributes,
+                                        self.vocab_size, self.device, nheads, nlayers, pad_token_id)
 
         self.norm_layer = nn.LayerNorm(latent_dim)
 
@@ -564,6 +576,33 @@ class MultimodalVAE(nn.Module):
             description = generate_natural_description(active_attributes)
             batch_descriptions.append(description)
         return batch_descriptions
+
+    def _text_to_attributes(self, text):
+
+        idx_to_attribute = {
+            0: 'young',
+            1: 'male',
+            2: 'female',
+            3: 'smiling',
+            4: 'eyeglasses',
+            5: 'black hair',
+            6: 'blond hair',
+            7: 'bald',
+            8: 'mustache',
+            9: 'wearing lipstick'
+        }
+
+        attributes=torch.zeros(len(self.idx_to_attribute), dtype=torch.int)
+        for i in range(len(idx_to_attribute)):
+            if idx_to_attribute[i] in text:
+                attributes[i] = 1
+
+
+        if attributes[2].item()==1:
+            attributes[1]=0
+
+
+        return attributes
 
     def reparameterize(self, mu, log_var):
         if self.training:
@@ -635,10 +674,11 @@ class MultimodalVAE(nn.Module):
 
                 outputs['text_mu'] = text_mu
                 outputs['text_log_var'] = text_log_var
+                pad_mask=pad_mask.type(torch.float)
 
 
             elif self.dataset=='CelebAMask-HQ':
-                z_text, text_mu, text_log_var = self.encode_text(target_attributes,  pad_mask)
+                z_text, text_mu, text_log_var = self.encode_text(target_attributes, attention_mask, pad_mask)
 
                 outputs['text_mu'] = text_mu
                 outputs['text_log_var'] = text_log_var
@@ -646,7 +686,7 @@ class MultimodalVAE(nn.Module):
 
             outputs['z_text'] = z_text.transpose(0,1)
 
-            attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes, tgt_mask, pad_mask.type(torch.float))
+            attr_probs, pred_attributes = self.text_decoder(z_text, target_attributes, tgt_mask, pad_mask)
             # if train_phase == True:
             #     #padding_mask = (target_attributes == self.tokenizer.tokenizer.pad_token_id)  # [B, T]
             #     attr_probs, pred_attributes = self.text_decoder(z_text,  target_attributes_s, tgt_mask, pad_mask)
@@ -710,10 +750,14 @@ class MultimodalVAE(nn.Module):
 
             pred_ids_list = pred_ids.detach().cpu().tolist()
 
+            pred_ids_list = [list(col) for col in zip(*pred_ids_list)]
+
             descriptions = [
                 tokenizer.decode(ids, skip_special_tokens=True)
                 for ids in pred_ids_list
             ]
+
+
         elif dataset=='CelebAMask-HQ':
             descriptions = self._attributes_to_text(pred_attributes)
             if len(descriptions) == 1:

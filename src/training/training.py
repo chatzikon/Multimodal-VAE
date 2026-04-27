@@ -157,6 +157,8 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
         target_attributes = batch['attributes'].to(device) if 'attributes' in batch else None
         pad_mask=0
         tgt_mask=0
+        pad_idx=0
+        attention_mask=None
     elif phase_config['dataset']=='Flickr30k':
         text = batch["caption"]
         input_tokens = clip_tokenizer(text).to(device)
@@ -169,7 +171,8 @@ def train_step(model, discriminator, batch, optimizer_G, optimizer_D, device, ep
 
         pad_idx = clip_tokenizer.tokenizer.pad_token_id
 
-    outputs = model(True, images=images, target_attributes=target_attributes, attention_mask=attention_mask, pad_mask=pad_mask, tgt_mask=tgt_mask, pad_id=pad_idx)
+    outputs = model(True, images=images, target_attributes=target_attributes, attention_mask=attention_mask,
+                    pad_mask=pad_mask, tgt_mask=tgt_mask, pad_id=pad_idx)
 
     # if phase_config['dataset'] == 'Flickr30k':
     #     pred_ids = torch.argmax(outputs['recon_text_probs'], dim=-1).float()
@@ -342,7 +345,6 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
         'val_total_loss':0
     }
 
-    pad_idx = clip_tokenizer.tokenizer.pad_token_id
 
     num_batches=0
     caption_pred_list=[]
@@ -357,6 +359,9 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
             if phase_config['dataset'] == 'CelebAMask-HQ':
                 target_attributes = batch['attributes'].to(device)
                 attention_mask=0
+                pad_mask=0
+                tgt_mask=0
+                pad_idx=0
             elif phase_config['dataset'] == 'Flickr30k':
                 text = batch["caption"]
                 input_tokens = clip_tokenizer(text).to(device)
@@ -514,11 +519,14 @@ def validate(model, discriminator, val_loader, device, epoch, phase_config, clip
 
                 caption_gt_list_tot.extend(caption_gt_list)
 
-    evaluation_metrics_dict=metrics_evaluation(num_batches, caption_pred_list, caption_gt_list_tot, caption_pred, images.size()[0])
+                evaluation_metrics_dict=metrics_evaluation(num_batches, caption_pred_list,
+                                               caption_gt_list_tot, caption_pred, images.size()[0])
 
     metrics = {k:v/num_batches for k,v in metrics.items()}
     metrics['val_total_loss'] = sum(v for k,v in metrics.items() if k not in ['val_attribute_accuracy','val_key_attribute_accuracy'])
-    metrics.update(evaluation_metrics_dict)
+
+    if phase_config['dataset'] == 'Flickr30k':
+        metrics.update(evaluation_metrics_dict)
 
     return metrics
 
@@ -571,6 +579,9 @@ def evaluate_model(model, discriminator, test_loader, device, epoch, phase_confi
 
             if phase_config['dataset'] == 'CelebAMask-HQ':
                 target_attributes = batch['attributes'].to(device)
+                pad_mask=0
+                tgt_mask=0
+                pad_idx=0
             elif phase_config['dataset'] == 'Flickr30k':
                 text = batch["caption"]
                 input_tokens = clip_tokenizer(text).to(device)

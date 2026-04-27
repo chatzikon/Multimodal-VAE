@@ -15,6 +15,9 @@ import textwrap
 
 from transformers import  AutoTokenizer
 
+from src.training.training import create_masks
+
+
 
 from src.config import config
 from src.data import CelebADataset, get_celeba_subset
@@ -50,9 +53,10 @@ def load_model_and_data(device, dataset, tokenizer, latent_dim, model_checkpoint
         num_attributes=32
     elif dataset=='CelebAMask-HQ':
         num_attributes = 10
+        vocab_size=0
 
 
-    model = MultimodalVAE(device,tokenizer, dataset,
+    model = MultimodalVAE(device,tokenizer, vocab_size, 'c', dataset,
         latent_dim=latent_dim, num_attributes=num_attributes,
         temperature=1.0
     ).to(device)
@@ -219,9 +223,9 @@ def evaluate_consistency(model, dataset, device, num_samples=100, threshold=0.20
             mismatched_attrs = torch.tensor(mismatch_attrs_np, dtype=torch.float32).to(device)
 
             # Encode and compute KL divergences with final mismatched_attrs
-            z_img, img_mu, img_logvar = model.encode_image(image)
-            z_text, text_mu, text_logvar = model.encode_text(attributes)
-            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs)
+            z_img, img_mu, img_logvar, _ = model.encode_image(image)
+            z_text, text_mu, text_logvar = model.encode_text(attributes, None, None)
+            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs, None, None)
 
             kl_match = torch.mean(0.5 * (
                 (text_logvar - img_logvar) +
@@ -288,9 +292,9 @@ def calculate_consistency_metrics(model, dataset, device, num_samples=1000):
                     mismatched_attrs = torch.tensor(mismatch_attrs_np, dtype=torch.float32).to(device)
             
             # Get encodings
-            z_img, img_mu, img_logvar = model.encode_image(image)
-            z_text, text_mu, text_logvar = model.encode_text(attributes)
-            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs)
+            z_img, img_mu, img_logvar, _ = model.encode_image(image)
+            z_text, text_mu, text_logvar = model.encode_text(attributes, None, None)
+            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs, None, None )
             
             # Calculate KL divergences
             kl_match = torch.mean(0.5 * (
@@ -374,11 +378,11 @@ def visualize_consistency_pairs(model, dataset, device, num_samples=3, save_dir=
             mismatched_attrs = mismatched_sample['attributes'].unsqueeze(0).to(device)
 
             # Encode original pair
-            z_img, img_mu, img_logvar = model.encode_image(image)
-            z_text, text_mu, text_logvar = model.encode_text(attributes)
+            z_img, img_mu, img_logvar, _ = model.encode_image(image)
+            z_text, text_mu, text_logvar = model.encode_text(attributes, None, None)
 
             # Encode mismatched pair
-            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs)
+            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs, None, None)
 
             kl_match = torch.mean(0.5 * (
                 (text_logvar - img_logvar) +
@@ -427,8 +431,8 @@ def visualize_consistency_pairs(model, dataset, device, num_samples=3, save_dir=
             caption = sample['caption']
             
             # Encode original pair
-            z_img, img_mu, img_logvar = model.encode_image(image)
-            z_text, text_mu, text_logvar = model.encode_text(attributes)
+            z_img, img_mu, img_logvar, _ = model.encode_image(image)
+            z_text, text_mu, text_logvar = model.encode_text(attributes, None, None)
             
             kl_match = torch.mean(0.5 * (
                 (text_logvar - img_logvar) +
@@ -531,7 +535,7 @@ def visualize_consistency_pairs(model, dataset, device, num_samples=3, save_dir=
             # Decode the mismatched caption
             mismatched_caption = model._attributes_to_text(mismatched_attrs)[0]
 
-            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs)
+            z_mismatched, mis_mu, mis_logvar = model.encode_text(mismatched_attrs, None, None)
             kl_mismatch = torch.mean(0.5 * (
                 (mis_logvar - img_logvar) +
                 (torch.exp(img_logvar) + (img_mu - mis_mu)**2) / torch.exp(mis_logvar) - 
@@ -665,15 +669,17 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, dataset_id, tokeni
             if dataset_id == 'CelebAMask-HQ':
                 attrs = sample['attributes'].unsqueeze(0).to(device)
                 attention_mask=0
+                pad_mask=0
+                tgt_mask=0
             elif dataset_id=='Flickr30k':
                 text = sample["caption"]
                 input_tokens = tokenizer(text).to(device)
                 attrs = input_tokens['input_ids'].unsqueeze(0).to(device)
                 attention_mask = input_tokens['attention_mask']
+                pad_mask, tgt_mask = create_masks(attrs, pad_token=tokenizer.tokenizer.pad_token_id)
 
-
-            z_img, _, _ = model.encode_image(image)
-            z_txt, _, _ = model.encode_text(attrs, attention_mask)
+            z_img, _, _, _ = model.encode_image(image)
+            z_txt, _, _ = model.encode_text(attrs, attention_mask, pad_mask)
 
             z_images.append(z_img.cpu().numpy()[0])
             z_texts.append(z_txt.cpu().numpy()[0])
@@ -803,6 +809,36 @@ def visualize_paired_latent_spaces_2d(model, dataset, device, dataset_id, tokeni
         'perplexity': perplexity,
         'label_distribution': {label: labels.count(label) for label in set(labels)}
     }
+
+def evaluate_image_to_text_generation (model, dataset, device):
+    model.eval()
+    total_samples = len(dataset)
+    true_labels, predicted_labels = [], []
+
+    for idx in range(total_samples):
+        sample = dataset[idx]
+        image = sample['image'].unsqueeze(0).to(device)
+        attributes = sample['attributes'].to(int)
+        true_labels.extend(attributes.clone().detach().numpy())
+
+        with torch.no_grad():
+            generated_text = model.generate_from_image(image, 'CelebAMask-HQ', None)
+            predicted_attributes=model._text_to_attributes(generated_text)
+            predicted_labels.extend(predicted_attributes.clone().detach().numpy())
+
+    labels = [0,1]
+
+    matches = sum(1 for a, b in zip(true_labels, predicted_labels) if a == b)
+
+    cm = confusion_matrix(true_labels, predicted_labels, labels=labels)
+
+
+    tn, fp, fn, tp = cm.ravel()
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
     
 def visualize_image_to_text_generation(model, dataset, device, num_samples=4, save_dir='eval_results'):
     os.makedirs(save_dir, exist_ok=True)
@@ -815,9 +851,9 @@ def visualize_image_to_text_generation(model, dataset, device, num_samples=4, sa
         sample = dataset[idx]
         image = sample['image'].unsqueeze(0).to(device)
         gt_caption = sample['caption']
-        
+
         with torch.no_grad():
-            generated_text = model.generate_from_image(image)
+            generated_text = model.generate_from_image(image, 'CelebAMask-HQ', None)
         
         fig, axes = plt.subplots(1, 2, figsize=(8, 3))
         
@@ -852,7 +888,7 @@ def visualize_text_to_image_generation(model, dataset, device, num_samples=4, sa
         gt_caption = sample['caption']
         
         with torch.no_grad():
-            generated_image = model.generate_from_text(attributes)[0].cpu()
+            generated_image = model.generate_from_text(attributes, None, None)[0].cpu()
         
         fig, axes = plt.subplots(1, 2, figsize=(8, 3))
         
@@ -903,6 +939,10 @@ def evaluate_main(kl_coef,lr_coef, dataset, latent_dim=256, model_checkpoint='ch
     if dataset=='Flickr30k':
         train_subset=full_dataset[0]
         val_subset=full_dataset[1]
+
+        visualize_paired_latent_spaces_2d(model, val_subset, device, dataset, clip_tokenizer, num_samples=500,
+                                          save_dir='eval_results/' + str(kl_coef) + '_' + str(lr_coef))
+
     elif dataset=='CelebAMask-HQ':
         train_subset, val_subset = torch.utils.data.random_split(
             full_dataset,
@@ -912,39 +952,42 @@ def evaluate_main(kl_coef,lr_coef, dataset, latent_dim=256, model_checkpoint='ch
 
 
 
-    #evaluate_train_val(model, device, train_subset, val_subset)
-    
-    # confusion matrix for consistency pairs
-    # metrics = visualize_consistency_pairs(model, val_subset, device, num_samples=3, save_dir='eval_results/'+str(kl_coef))
-    # visualize_consistency_confusion_matrix(metrics, save_dir='eval_results/'+str(kl_coef))
-    # scores = evaluate_consistency(model, val_subset, device)
-    # print(f"Consistency Classification Accuracy: {scores['accuracy']:.3f}")
-    # print(f"Threshold used: {scores['threshold']}")
-    # print(f"Correct classifications: {scores['correct']}/{scores['total']}")
-    
-    # Visualize pairs with scores
-    #visualize_consistency_pairs(model, val_subset, device)
-    
-    visualize_paired_latent_spaces_2d(model, val_subset, device, dataset, clip_tokenizer, num_samples=500, save_dir='eval_results/'+str(kl_coef)+'_'+str(lr_coef))
-        
-    # Visualize 5 samples of image-to-text generation
-    #visualize_image_to_text_generation(model, val_subset, device, num_samples=10, save_dir='eval_results')
+        # evaluate_train_val(model, device, train_subset, val_subset)
+        #
+        # # confusion matrix for consistency pairs
+        #metrics = visualize_consistency_pairs(model, val_subset, device, num_samples=3, save_dir='eval_results/'+str(kl_coef))
+        #visualize_consistency_confusion_matrix(metrics, save_dir='eval_results/'+str(kl_coef))
+        # scores = evaluate_consistency(model, val_subset, device)
+        # print(f"Consistency Classification Accuracy: {scores['accuracy']:.3f}")
+        # print(f"Threshold used: {scores['threshold']}")
+        # print(f"Correct classifications: {scores['correct']}/{scores['total']}")
 
-    # Visualize 5 samples of text-to-image generation
-    #visualize_text_to_image_generation(model, val_subset, device, num_samples=10, save_dir='eval_results')
-    
-    #visualize_random_examples(full_dataset, num_samples=5)
+        evaluate_image_to_text_generation(model, val_subset, device, )
+
+        # Visualize pairs with scores
+        visualize_consistency_pairs(model, val_subset, device)
+
+
+        # Visualize 5 samples of image-to-text generation
+        visualize_image_to_text_generation(model, val_subset, device, num_samples=10, save_dir='eval_results')
+
+        # Visualize 5 samples of text-to-image generation
+        visualize_text_to_image_generation(model, val_subset, device, num_samples=10, save_dir='eval_results')
+
+    visualize_random_examples(full_dataset, num_samples=5)
     
 if __name__ == "__main__":
 
     kl_coef='kl_coef_1'
     lr_coef='lr_0.0001'
-    dataset='Flickr30k'
-    #dataset='CelebAMask-HQ'
+    #dataset='Flickr30k'
+    dataset='CelebAMask-HQ'
 
     # consistency checking scores
     #evaluate_main(latent_dim=128, model_checkpoint='checkpoints/final_model_128.pt')
     #evaluate_main(kl_coef, lr_coef, dataset, latent_dim=256, model_checkpoint='checkpoints/final_model_'+str(kl_coef)+'.pt')
 
-    evaluate_main(kl_coef, lr_coef, dataset, latent_dim=256, model_checkpoint='checkpoints/final_model_'+str(kl_coef)+'_'+str(lr_coef)+'.pt')
+    evaluate_main(kl_coef, lr_coef, dataset, latent_dim=512,
+                  model_checkpoint='/home/chatziko/PycharmProjects/PythonProject/Multimodal-VAE/checkpoints/'
+                                   'final_model_kl_coef_1.0_lr_0.0001_latent_dim_512_scheme_c.pt')
     #evaluate_main(latent_dim=512, model_checkpoint='checkpoints/final_model_512.pt')
